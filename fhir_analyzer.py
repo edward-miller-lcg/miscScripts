@@ -809,6 +809,181 @@ def write_summary_sheet(ws, results: list, all_resource_counts: dict) -> None:
     ws.freeze_panes = "A2"
 
 
+# ── Medication code frequency ─────────────────────────────────────────────────
+
+# Resource types to include and the field(s) that carry the coded concept
+MED_RESOURCE_TYPES = [
+    "Medication",                # code               (CodeableConcept)
+    "MedicationRequest",         # medicationCodeableConcept (poly CC variant)
+    "MedicationAdministration",  # medicationCodeableConcept (poly CC variant)
+    "MedicationDispense",        # medicationCodeableConcept (poly CC variant)
+]
+
+# Maps resource type → list of top-level fields that may hold a CodeableConcept
+_MED_CC_FIELDS = {
+    "Medication":                ["code"],
+    "MedicationRequest":         ["medicationCodeableConcept"],
+    "MedicationAdministration":  ["medicationCodeableConcept"],
+    "MedicationDispense":        ["medicationCodeableConcept"],
+}
+
+
+def _extract_med_codings(resource: dict, rtype: str) -> list:
+    """
+    Return a list of (system, code, display) tuples from the relevant
+    CodeableConcept field(s) of a medication resource.
+    medicationReference rows carry no inline code and are silently skipped.
+    """
+    results = []
+    for field in _MED_CC_FIELDS.get(rtype, []):
+        val = resource.get(field)
+        if not isinstance(val, dict):
+            continue
+        for coding in val.get("coding", []):
+            if not isinstance(coding, dict):
+                continue
+            system  = (coding.get("system")  or "").strip()
+            code    = (coding.get("code")    or "").strip()
+            display = (coding.get("display") or "").strip()
+            if system or code:          # skip entirely empty codings
+                results.append((system, code, display))
+    return results
+
+
+def build_med_code_counts(resources: dict) -> tuple:
+    """
+    Scan all medication resources and build a frequency table keyed on
+    (system, code, display).
+
+    Returns:
+        rows          — list of dicts sorted by total count desc
+        present_types — ordered list of resource types actually found in data
+    """
+    present_types = [t for t in MED_RESOURCE_TYPES if resources.get(t)]
+
+    # counts[(system, code, display)][rtype] += 1  per resource instance
+    counts: dict = defaultdict(lambda: defaultdict(int))
+
+    for rtype in present_types:
+        for resource in resources[rtype]:
+            for key in _extract_med_codings(resource, rtype):
+                counts[key][rtype] += 1
+
+    rows = []
+    for (system, code, display), type_counts in counts.items():
+        rows.append({
+            "system":   system,
+            "code":     code,
+            "display":  display,
+            "by_type":  dict(type_counts),
+            "total":    sum(type_counts.values()),
+        })
+
+    rows.sort(key=lambda r: (-r["total"], r["system"], r["code"], r["display"]))
+    return rows, present_types
+
+
+def write_medication_sheet(ws, rows: list, present_types: list) -> None:
+    """
+    Write the Medication Code Frequency tab.
+
+    Columns:
+        Code System | Code | Display | Count in <TypeA> | Count in <TypeB> | … | Total Count
+    One row per unique (system, code, display) combination, sorted by total desc.
+    """
+    # ── Headers ───────────────────────────────────────────────────────────────
+    headers = ["Code System", "Code", "Display"]
+    for rtype in present_types:
+        headers.append(f"Count in\n{rtype}")
+    headers.append("Total\nCount")
+
+    ws.row_dimensions[1].height = 40
+    for ci, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill      = _fill(_C["hdr_bg"])
+        cell.alignment = CENTER
+
+    if not rows:
+        ws.cell(row=2, column=1, value="No medication coding data found.")
+        return
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    # Highlight rows that use a standard system
+    std_label = {
+        "http://www.nlm.nih.gov/research/umls/rxnorm": "RxNorm",
+        "http://snomed.info/sct":                       "SNOMED CT",
+        "http://loinc.org":                             "LOINC",
+    }
+
+    for ri, row in enumerate(rows, 2):
+        ws.row_dimensions[ri].height = 16
+
+        is_standard = row["system"] in STANDARD_SYSTEMS
+        if is_standard:
+            stripe = _fill(_C["std_bg"])          # soft green for standard systems
+        elif ri % 2 == 0:
+            stripe = _fill(_C["stripe_a"])
+        else:
+            stripe = _fill(_C["stripe_b"])
+
+        def put(col, val, align=LEFT, fmt=None, bold=False):
+            cell = ws.cell(row=ri, column=col, value=val)
+            cell.fill      = stripe
+            cell.alignment = align
+            cell.font      = _font(bold=bold)
+            if fmt:
+                cell.number_format = fmt
+
+        put(1, row["system"])
+        put(2, row["code"])
+        put(3, row["display"])
+
+        for ti, rtype in enumerate(present_types, 4):
+            put(ti, row["by_type"].get(rtype, 0), CENTER, NUMFMT)
+
+        total_col = 4 + len(present_types)
+        tc = ws.cell(row=ri, column=total_col, value=row["total"])
+        tc.fill           = stripe
+        tc.alignment      = CENTER
+        tc.font           = _font(bold=True)
+        tc.number_format  = NUMFMT
+
+    # ── Column widths & freeze ────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 55   # Code System
+    ws.column_dimensions["B"].width = 20   # Code
+    ws.column_dimensions["C"].width = 52   # Display
+    for ci in range(4, 4 + len(present_types) + 1):
+        ws.column_dimensions[get_column_letter(ci)].width = 18
+
+    ws.freeze_panes = "A2"
+
+    # ── Totals row at the bottom ──────────────────────────────────────────────
+    last_data_row = 1 + len(rows)
+    totals_row    = last_data_row + 2          # blank separator row first
+
+    ws.row_dimensions[totals_row].height = 18
+    label_cell = ws.cell(row=totals_row, column=1, value="TOTALS")
+    label_cell.font      = _font(bold=True, color=_C["hdr_fg"])
+    label_cell.fill      = _fill(_C["summary_hdr"])
+    label_cell.alignment = CENTER
+
+    for ti, rtype in enumerate(present_types, 4):
+        col_total = sum(r["by_type"].get(rtype, 0) for r in rows)
+        cell = ws.cell(row=totals_row, column=ti, value=col_total)
+        cell.font         = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill         = _fill(_C["summary_hdr"])
+        cell.alignment    = CENTER
+        cell.number_format = NUMFMT
+
+    grand_total = sum(r["total"] for r in rows)
+    gt_cell = ws.cell(row=totals_row, column=4 + len(present_types), value=grand_total)
+    gt_cell.font         = _font(bold=True, color=_C["hdr_fg"])
+    gt_cell.fill         = _fill(_C["summary_hdr"])
+    gt_cell.alignment    = CENTER
+    gt_cell.number_format = NUMFMT
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -885,6 +1060,12 @@ def main() -> None:
     ws_detail = wb.create_sheet("FHIR Element Analysis")
     write_detail_sheet(ws_detail, all_rows)
 
+    # Medication code frequency sheet
+    print("Building medication code frequency table…")
+    med_rows, med_present_types = build_med_code_counts(resources)
+    ws_med = wb.create_sheet("Medication Codes")
+    write_medication_sheet(ws_med, med_rows, med_present_types)
+
     wb.save(output_path)
 
     # ── Console summary ───────────────────────────────────────────────────────
@@ -896,6 +1077,8 @@ def main() -> None:
     print(
         f"\nResults:  {n_yes} fully present  |  {n_no} have gaps  |  {n_na} N/A\n"
         f"Code systems found across all elements: {total_sys} distinct entries\n"
+        f"Distinct medication codes found: {len(med_rows):,} "
+        f"across {len(med_present_types)} resource type(s)\n"
         f"Report:   {output_path.resolve()}"
     )
 
