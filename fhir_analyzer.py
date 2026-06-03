@@ -1125,6 +1125,405 @@ def write_data_inventory_sheet(ws, inventory_rows: list) -> None:
     ws.freeze_panes = "A2"
 
 
+# ── Dose & Route extraction ───────────────────────────────────────────────────
+
+def _primary_med_code(resource: dict, rtype: str) -> tuple:
+    """
+    Return (system, code, display) of the first coding for the medication field.
+    Falls back to empty strings if not present.
+    """
+    cc = (resource.get("code")
+          if rtype == "Medication"
+          else resource.get("medicationCodeableConcept"))
+    if isinstance(cc, dict):
+        for coding in cc.get("coding", []):
+            if isinstance(coding, dict):
+                return (
+                    coding.get("system",  "") or "",
+                    coding.get("code",    "") or "",
+                    coding.get("display", "") or "",
+                )
+    return ("", "", "")
+
+
+def _route_from_cc(route_cc) -> tuple:
+    """Return (system, code, display, missing) from a route CodeableConcept."""
+    if isinstance(route_cc, dict):
+        for coding in route_cc.get("coding", []):
+            if isinstance(coding, dict):
+                return (
+                    coding.get("system",  "") or "",
+                    coding.get("code",    "") or "",
+                    coding.get("display", "") or "",
+                    False,
+                )
+    return ("", "", "", True)
+
+
+def _dose_from_quantity(dq: dict) -> dict:
+    """Unpack a SimpleQuantity / doseQuantity into dose fields."""
+    return {
+        "dose_type":             "Quantity",
+        "dose_value":            dq.get("value"),
+        "dose_unit":             dq.get("unit") or dq.get("code") or "",
+        "dose_range_low_value":  None,
+        "dose_range_low_unit":   None,
+        "dose_range_high_value": None,
+        "dose_range_high_unit":  None,
+        "dose_missing":          False,
+    }
+
+
+def _dose_from_range(dr: dict) -> dict:
+    """Unpack a doseRange into dose fields."""
+    low  = dr.get("low",  {}) if isinstance(dr.get("low"),  dict) else {}
+    high = dr.get("high", {}) if isinstance(dr.get("high"), dict) else {}
+    return {
+        "dose_type":             "Range",
+        "dose_value":            None,
+        "dose_unit":             None,
+        "dose_range_low_value":  low.get("value"),
+        "dose_range_low_unit":   low.get("unit")  or low.get("code")  or "",
+        "dose_range_high_value": high.get("value"),
+        "dose_range_high_unit":  high.get("unit") or high.get("code") or "",
+        "dose_missing":          False,
+    }
+
+
+_EMPTY_DOSE = {
+    "dose_type": None, "dose_value": None, "dose_unit": None,
+    "dose_range_low_value": None, "dose_range_low_unit": None,
+    "dose_range_high_value": None, "dose_range_high_unit": None,
+    "dose_missing": True,
+}
+
+
+def extract_dose_route_data(resources: dict) -> tuple:
+    """
+    Walk MedicationRequest and MedicationAdministration resources and extract
+    every dose + route entry.
+
+    MedicationRequest  — one row per dosageInstruction element (indexed).
+                         Dose comes from dosageInstruction[].doseAndRate[]
+                         (doseQuantity or doseRange variants).
+
+    MedicationAdministration — one row per resource.
+                         Dose comes from dosage.dose (SimpleQuantity only).
+
+    Returns:
+        detail_rows  — all entries (present and missing)
+        missing_rows — entries where route OR dose is absent
+    """
+    detail_rows  = []
+    missing_rows = []
+
+    # ── MedicationRequest ─────────────────────────────────────────────────────
+    for r in resources.get("MedicationRequest", []):
+        rid                        = r.get("id", "")
+        med_sys, med_code, med_disp = _primary_med_code(r, "MedicationRequest")
+        dosage_instructions        = r.get("dosageInstruction") or []
+
+        if not dosage_instructions:
+            # Resource exists but has no dosageInstruction at all
+            row = {
+                "resource_type": "MedicationRequest",
+                "resource_id":   rid,
+                "med_system":    med_sys,
+                "med_code":      med_code,
+                "med_display":   med_disp,
+                "dosage_index":  None,
+                "route_system":  "", "route_code": "", "route_display": "",
+                **_EMPTY_DOSE,
+                "route_missing": True,
+            }
+            detail_rows.append(row)
+            missing_rows.append(_make_missing_row(
+                "MedicationRequest", rid, med_sys, med_code, med_disp,
+                missing_route=True, missing_dose=True))
+            continue
+
+        resource_missing_route = False
+        resource_missing_dose  = False
+
+        for idx, di in enumerate(dosage_instructions):
+            if not isinstance(di, dict):
+                continue
+
+            # Route
+            rs, rc, rd, route_missing = _route_from_cc(di.get("route"))
+            if route_missing:
+                resource_missing_route = True
+
+            # Dose — walk doseAndRate, accept first doseQuantity or doseRange found
+            dose_fields = dict(_EMPTY_DOSE)
+            for dar in (di.get("doseAndRate") or []):
+                if not isinstance(dar, dict):
+                    continue
+                if isinstance(dar.get("doseQuantity"), dict):
+                    dose_fields = _dose_from_quantity(dar["doseQuantity"])
+                    break
+                if isinstance(dar.get("doseRange"), dict):
+                    dose_fields = _dose_from_range(dar["doseRange"])
+                    break
+
+            if dose_fields["dose_missing"]:
+                resource_missing_dose = True
+
+            detail_rows.append({
+                "resource_type": "MedicationRequest",
+                "resource_id":   rid,
+                "med_system":    med_sys,
+                "med_code":      med_code,
+                "med_display":   med_disp,
+                "dosage_index":  idx + 1,
+                "route_system":  rs, "route_code": rc, "route_display": rd,
+                **dose_fields,
+                "route_missing": route_missing,
+            })
+
+        if resource_missing_route or resource_missing_dose:
+            missing_rows.append(_make_missing_row(
+                "MedicationRequest", rid, med_sys, med_code, med_disp,
+                missing_route=resource_missing_route,
+                missing_dose=resource_missing_dose))
+
+    # ── MedicationAdministration ──────────────────────────────────────────────
+    for r in resources.get("MedicationAdministration", []):
+        rid                        = r.get("id", "")
+        med_sys, med_code, med_disp = _primary_med_code(r, "MedicationAdministration")
+        dosage                     = r.get("dosage")
+
+        if not isinstance(dosage, dict):
+            row = {
+                "resource_type": "MedicationAdministration",
+                "resource_id":   rid,
+                "med_system":    med_sys,
+                "med_code":      med_code,
+                "med_display":   med_disp,
+                "dosage_index":  None,
+                "route_system":  "", "route_code": "", "route_display": "",
+                **_EMPTY_DOSE,
+                "route_missing": True,
+            }
+            detail_rows.append(row)
+            missing_rows.append(_make_missing_row(
+                "MedicationAdministration", rid, med_sys, med_code, med_disp,
+                missing_route=True, missing_dose=True))
+            continue
+
+        # Route
+        rs, rc, rd, route_missing = _route_from_cc(dosage.get("route"))
+
+        # Dose — MedAdmin uses dosage.dose (SimpleQuantity, no doseRange)
+        dose_obj = dosage.get("dose")
+        dose_fields = _dose_from_quantity(dose_obj) if isinstance(dose_obj, dict) else dict(_EMPTY_DOSE)
+
+        detail_rows.append({
+            "resource_type": "MedicationAdministration",
+            "resource_id":   rid,
+            "med_system":    med_sys,
+            "med_code":      med_code,
+            "med_display":   med_disp,
+            "dosage_index":  1,
+            "route_system":  rs, "route_code": rc, "route_display": rd,
+            **dose_fields,
+            "route_missing": route_missing,
+        })
+
+        if route_missing or dose_fields["dose_missing"]:
+            missing_rows.append(_make_missing_row(
+                "MedicationAdministration", rid, med_sys, med_code, med_disp,
+                missing_route=route_missing,
+                missing_dose=dose_fields["dose_missing"]))
+
+    return detail_rows, missing_rows
+
+
+def _make_missing_row(rtype, rid, med_sys, med_code, med_disp,
+                      missing_route, missing_dose) -> dict:
+    return {
+        "resource_type": rtype,
+        "resource_id":   rid,
+        "med_system":    med_sys,
+        "med_code":      med_code,
+        "med_display":   med_disp,
+        "missing_route": missing_route,
+        "missing_dose":  missing_dose,
+    }
+
+
+# ── Sheet: Dose & Route Detail ────────────────────────────────────────────────
+
+DR_DETAIL_HEADERS = [
+    "Resource Type",       # A
+    "Resource ID",         # B
+    "Med Code System",     # C
+    "Med Code",            # D
+    "Med Display",         # E
+    "Dosage\nIndex",       # F
+    "Route System",        # G
+    "Route Code",          # H
+    "Route Display",       # I
+    "Dose Type",           # J
+    "Dose Value",          # K
+    "Dose Unit",           # L
+    "Range Low\nValue",    # M
+    "Range Low\nUnit",     # N
+    "Range High\nValue",   # O
+    "Range High\nUnit",    # P
+    "Route\nMissing",      # Q
+    "Dose\nMissing",       # R
+]
+
+DR_DETAIL_WIDTHS = [24, 36, 46, 18, 46, 10, 46, 18, 36, 12, 12, 18, 14, 14, 14, 14, 10, 10]
+
+
+def write_dose_route_detail_sheet(ws, detail_rows: list) -> None:
+    ws.row_dimensions[1].height = 40
+    for ci, h in enumerate(DR_DETAIL_HEADERS, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill      = _fill(_C["hdr_bg"])
+        cell.alignment = CENTER
+
+    if not detail_rows:
+        ws.cell(row=2, column=1, value="No MedicationRequest or MedicationAdministration data found.")
+        return
+
+    prev_rtype   = None
+    stripe_color = _C["stripe_a"]
+
+    for ri, row in enumerate(detail_rows, 2):
+        ws.row_dimensions[ri].height = 15
+
+        if row["resource_type"] != prev_rtype:
+            stripe_color = _C["stripe_a"] if stripe_color == _C["stripe_b"] else _C["stripe_b"]
+            prev_rtype = row["resource_type"]
+
+        # Rows with any missing field get a subtle red tint on the flag columns
+        base_stripe = _fill(stripe_color)
+
+        def put(col, val, align=LEFT, fmt=None, fill=None):
+            cell = ws.cell(row=ri, column=col, value=val)
+            cell.fill      = fill or base_stripe
+            cell.alignment = align
+            cell.font      = _font()
+            if fmt:
+                cell.number_format = fmt
+            return cell
+
+        put(1,  row["resource_type"])
+        put(2,  row["resource_id"])
+        put(3,  row["med_system"])
+        put(4,  row["med_code"])
+        put(5,  row["med_display"])
+        put(6,  row["dosage_index"],  CENTER)
+        put(7,  row["route_system"])
+        put(8,  row["route_code"])
+        put(9,  row["route_display"])
+        put(10, row["dose_type"],     CENTER)
+        put(11, row["dose_value"],    CENTER)
+        put(12, row["dose_unit"],     CENTER)
+        put(13, row["dose_range_low_value"],  CENTER)
+        put(14, row["dose_range_low_unit"],   CENTER)
+        put(15, row["dose_range_high_value"], CENTER)
+        put(16, row["dose_range_high_unit"],  CENTER)
+
+        # Flag columns — colour-coded Yes/No
+        for col, flag_val in [(17, row["route_missing"]), (18, row["dose_missing"])]:
+            label = "Yes" if flag_val else "No"
+            fc = ws.cell(row=ri, column=col, value=label)
+            fc.alignment = CENTER
+            if flag_val:
+                fc.fill = _fill(_C["no_bg"])
+                fc.font = _font(bold=True, color=_C["no_fg"])
+            else:
+                fc.fill = _fill(_C["yes_bg"])
+                fc.font = _font(bold=True, color=_C["yes_fg"])
+
+    for ci, w in enumerate(DR_DETAIL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+
+
+# ── Sheet: Missing Dose or Route ──────────────────────────────────────────────
+
+def write_missing_dose_route_sheet(ws, missing_rows: list) -> None:
+    HDR = [
+        "Resource Type", "Resource ID",
+        "Med Code System", "Med Code", "Med Display",
+        "Missing\nRoute", "Missing\nDose",
+    ]
+    ws.row_dimensions[1].height = 32
+    for ci, h in enumerate(HDR, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill      = _fill(_C["hdr_bg"])
+        cell.alignment = CENTER
+
+    if not missing_rows:
+        ws.cell(row=2, column=1,
+                value="No resources with missing dose or route found — all present.")
+        ws.cell(row=2, column=1).font = _font(bold=True, color=_C["yes_fg"])
+        return
+
+    # Sort: resource type → med code → resource id
+    missing_rows = sorted(
+        missing_rows,
+        key=lambda r: (r["resource_type"], r["med_code"], r["resource_id"]),
+    )
+
+    prev_rtype   = None
+    stripe_color = _C["stripe_a"]
+
+    for ri, row in enumerate(missing_rows, 2):
+        ws.row_dimensions[ri].height = 15
+
+        if row["resource_type"] != prev_rtype:
+            stripe_color = _C["stripe_a"] if stripe_color == _C["stripe_b"] else _C["stripe_b"]
+            prev_rtype = row["resource_type"]
+
+        stripe = _fill(stripe_color)
+
+        for ci, val in enumerate([
+            row["resource_type"], row["resource_id"],
+            row["med_system"], row["med_code"], row["med_display"],
+        ], 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.fill = stripe; cell.alignment = LEFT; cell.font = _font()
+
+        for col, flag in [(6, row["missing_route"]), (7, row["missing_dose"])]:
+            label = "Yes" if flag else "No"
+            fc = ws.cell(row=ri, column=col, value=label)
+            fc.alignment = CENTER
+            if flag:
+                fc.fill = _fill(_C["no_bg"])
+                fc.font = _font(bold=True, color=_C["no_fg"])
+            else:
+                fc.fill = _fill(_C["yes_bg"])
+                fc.font = _font(bold=True, color=_C["yes_fg"])
+
+    # Summary counts at the bottom
+    gap_row = len(missing_rows) + 3
+    ws.row_dimensions[gap_row].height = 18
+    n_route = sum(1 for r in missing_rows if r["missing_route"])
+    n_dose  = sum(1 for r in missing_rows if r["missing_dose"])
+    for ci, val in enumerate([
+        "TOTALS", f"{len(missing_rows)} resources flagged",
+        "", "", "",
+        f"{n_route} missing route",
+        f"{n_dose} missing dose",
+    ], 1):
+        cell = ws.cell(row=gap_row, column=ci, value=val)
+        cell.font = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill = _fill(_C["summary_hdr"])
+        cell.alignment = CENTER if ci > 1 else LEFT
+
+    for ci, w in enumerate([24, 36, 46, 18, 46, 14, 14], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1198,6 +1597,9 @@ def main() -> None:
     print("Building medication code frequency table…")
     med_rows, med_present_types = build_med_code_counts(resources)
 
+    print("Extracting dose and route data…")
+    dose_route_detail, dose_route_missing = extract_dose_route_data(resources)
+
     # ── Expand detail rows ────────────────────────────────────────────────────
     all_detail_rows = []
     for result in results:
@@ -1236,6 +1638,14 @@ def main() -> None:
     ws_inv = wb.create_sheet("Data Inventory")
     write_data_inventory_sheet(ws_inv, inventory_rows)
 
+    # 6 — Dose & Route Detail
+    ws_dr = wb.create_sheet("Dose & Route Detail")
+    write_dose_route_detail_sheet(ws_dr, dose_route_detail)
+
+    # 7 — Missing Dose or Route
+    ws_miss = wb.create_sheet("Missing Dose or Route")
+    write_missing_dose_route_sheet(ws_miss, dose_route_missing)
+
     wb.save(output_path)
 
     # ── Console summary ───────────────────────────────────────────────────────
@@ -1248,6 +1658,8 @@ def main() -> None:
         f"Med codes:   {len(med_rows):,} distinct (system + code + display) combos\n"
         f"Cat codes:   {sum(len(v) for v in category_data.values()):,} distinct entries\n"
         f"Inventory:   {len(inventory_rows):,} distinct element paths across all types\n"
+        f"Dose/Route:  {len(dose_route_detail):,} dosage entries  |  "
+        f"{len(dose_route_missing):,} resources flagged missing\n"
         f"Report:      {output_path.resolve()}"
     )
 
