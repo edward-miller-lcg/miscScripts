@@ -1734,14 +1734,25 @@ def build_patient_medication_map(resources: dict) -> tuple:
             for system, code in _all_med_codes(r, rtype, med_lookup):
                 patient_codes[pid].add((system, code))
 
-    # ── Step 4: flatten to one row per (patient_id, system, code) ────────────
+    # ── Step 4: flatten to one row per (patient_id, system) ─────────────────
+    # Group codes by system for each patient, then comma-delimit within each group
+    from collections import defaultdict as _dd
+    grouped: dict = {}
+    for pid, code_pairs in patient_codes.items():
+        by_system: dict = _dd(set)
+        for system, code in code_pairs:
+            by_system[system].add(code)
+        grouped[pid] = by_system
+
     rows = []
-    for pid, code_pairs in sorted(patient_codes.items()):
-        for system, code in sorted(code_pairs):
+    for pid in sorted(grouped):
+        for system in sorted(grouped[pid]):
+            codes_str = ", ".join(sorted(grouped[pid][system]))
             rows.append({
-                "patient_id": pid,
+                "patient_id":  pid,
                 "code_system": system,
-                "code":        code,
+                "codes":       codes_str,
+                "code_count":  len(grouped[pid][system]),
             })
 
     return rows, unresolved
@@ -1755,8 +1766,13 @@ def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> Non
     Patient ID stripes change when the patient changes so it's easy to scan
     which codes belong to the same patient.
     """
-    HDR = ["Patient ID", "Code System", "Medication Code"]
-    ws.row_dimensions[1].height = 28
+    HDR = [
+        "Patient ID",
+        "Code System",
+        "Medication Codes\n(comma-delimited)",
+        "Distinct\nCode Count",
+    ]
+    ws.row_dimensions[1].height = 36
     for ci, h in enumerate(HDR, 1):
         cell = ws.cell(row=1, column=ci, value=h)
         cell.font      = _font(bold=True, color=_C["hdr_fg"])
@@ -1773,27 +1789,32 @@ def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> Non
     stripe_color = _C["stripe_a"]
 
     for ri, row in enumerate(rows, 2):
-        ws.row_dimensions[ri].height = 15
+        ws.row_dimensions[ri].height = 28   # taller to accommodate wrapped codes
 
-        # Alternate stripe each time the patient ID changes so rows for the
-        # same patient are visually grouped
+        # Stripe alternates per patient so each patient's rows are visually grouped
         if row["patient_id"] != prev_pid:
             stripe_color = (_C["stripe_a"] if stripe_color == _C["stripe_b"]
                             else _C["stripe_b"])
             prev_pid = row["patient_id"]
 
-        # Highlight rows whose system is one of the standard three
-        if row["code_system"] in STANDARD_SYSTEMS:
-            stripe = _fill(_C["std_bg"])
-        else:
-            stripe = _fill(stripe_color)
+        # Standard systems get the green highlight so RxNorm/SNOMED/LOINC
+        # rows stand out from local/PCC rows within the same patient block
+        base = (_fill(_C["std_bg"]) if row["code_system"] in STANDARD_SYSTEMS
+                else _fill(stripe_color))
 
-        for ci, val in enumerate(
-                [row["patient_id"], row["code_system"], row["code"]], 1):
+        for ci, (val, align) in enumerate([
+            (row["patient_id"],  LEFT),
+            (row["code_system"], LEFT),
+            (row["codes"],       Alignment(horizontal="left", vertical="top",
+                                           wrap_text=True)),
+            (row["code_count"],  CENTER),
+        ], 1):
             cell = ws.cell(row=ri, column=ci, value=val)
-            cell.fill      = stripe
-            cell.alignment = LEFT
+            cell.fill      = base
+            cell.alignment = align
             cell.font      = _font()
+            if ci == 4:
+                cell.number_format = NUMFMT
 
     # Summary footer
     n_patients = len({r["patient_id"] for r in rows})
@@ -1801,7 +1822,7 @@ def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> Non
     ws.row_dimensions[footer_row].height = 18
     for ci, text in [
         (1, f"Total patients: {n_patients:,}"),
-        (2, f"Total (patient, system, code) rows: {len(rows):,}"),
+        (2, f"Total (patient × system) rows: {len(rows):,}"),
         (3, f"Unresolved med resources: {unresolved_count:,}"),
     ]:
         cell = ws.cell(row=footer_row, column=ci, value=text)
@@ -1811,7 +1832,8 @@ def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> Non
 
     ws.column_dimensions["A"].width = 38
     ws.column_dimensions["B"].width = 55
-    ws.column_dimensions["C"].width = 24
+    ws.column_dimensions["C"].width = 60
+    ws.column_dimensions["D"].width = 14
     ws.freeze_panes = "A2"
 
 
@@ -1962,7 +1984,7 @@ def main() -> None:
         f"Dose/Route:  {len(dose_route_detail):,} dosage entries  |  "
         f"{len(dose_route_missing):,} resources flagged missing\n"
         f"Patient map: {len({r['patient_id'] for r in patient_med_rows}):,} patients  |  "
-        f"{len(patient_med_rows):,} (patient, system, code) rows  |  "
+        f"{len(patient_med_rows):,} (patient × system) rows  |  "
         f"{unresolved_count:,} unresolvable\n"
         f"Report:      {output_path.resolve()}"
     )
