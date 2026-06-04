@@ -719,30 +719,99 @@ _MED_CC_FIELDS = {
 }
 
 
-def _extract_med_codings(resource: dict, rtype: str) -> list:
-    results = []
-    for field in _MED_CC_FIELDS.get(rtype, []):
-        val = resource.get(field)
-        if not isinstance(val, dict):
+def _build_medication_lookup(resources: dict) -> dict:
+    """
+    Build a {medication_id: [(system, code, display), ...]} map from all
+    Medication resources.  Used to resolve medicationReference pointers on
+    MedicationRequest / MedicationAdministration so that RxNorm (and other)
+    codes stored on the referenced Medication are not missed.
+    """
+    lookup: dict = {}
+    for med in resources.get("Medication", []):
+        mid = med.get("id", "")
+        if not mid:
             continue
-        for coding in val.get("coding", []):
+        codings = []
+        cc = med.get("code")
+        if isinstance(cc, dict):
+            for coding in cc.get("coding", []):
+                if not isinstance(coding, dict):
+                    continue
+                system  = (coding.get("system")  or "").strip()
+                code    = (coding.get("code")    or "").strip()
+                display = (coding.get("display") or "").strip()
+                if system or code:
+                    codings.append((system, code, display))
+        lookup[mid] = codings
+    return lookup
+
+
+def _resolve_med_ref(resource: dict, med_lookup: dict) -> list:
+    """
+    If the resource carries a medicationReference, resolve it against
+    med_lookup and return its (system, code, display) tuples.
+    Returns [] when the reference is absent, unresolvable, or already
+    covered by an inline medicationCodeableConcept.
+    """
+    med_ref = resource.get("medicationReference")
+    if not isinstance(med_ref, dict):
+        return []
+    ref_str = med_ref.get("reference", "")
+    # Extract the ID — handles "Medication/abc", full URLs, and bare IDs
+    parts = ref_str.rstrip("/").split("/")
+    mid = parts[-1] if parts else ""
+    return med_lookup.get(mid, [])
+
+
+def _extract_med_codings(resource: dict, rtype: str,
+                          med_lookup: dict | None = None) -> list:
+    """
+    Return (system, code, display) tuples for a medication resource.
+
+    Checks BOTH the inline CodeableConcept field AND any medicationReference
+    so that RxNorm codes stored on a separate Medication resource are included.
+    Deduplicates on (system, code) to avoid double-counting when both paths
+    carry the same coding.
+    """
+    seen   = set()
+    results = []
+
+    def _add_from_cc(cc):
+        if not isinstance(cc, dict):
+            return
+        for coding in cc.get("coding", []):
             if not isinstance(coding, dict):
                 continue
             system  = (coding.get("system")  or "").strip()
             code    = (coding.get("code")    or "").strip()
             display = (coding.get("display") or "").strip()
-            if system or code:
+            if (system or code) and (system, code) not in seen:
+                seen.add((system, code))
                 results.append((system, code, display))
+
+    # 1 — inline CodeableConcept (e.g. medicationCodeableConcept / code)
+    for field in _MED_CC_FIELDS.get(rtype, []):
+        _add_from_cc(resource.get(field))
+
+    # 2 — referenced Medication resource (carries the RxNorm code when the
+    #     request uses medicationReference instead of an inline CC)
+    if med_lookup is not None:
+        for system, code, display in _resolve_med_ref(resource, med_lookup):
+            if (system, code) not in seen:
+                seen.add((system, code))
+                results.append((system, code, display))
+
     return results
 
 
 def build_med_code_counts(resources: dict) -> tuple:
     present_types = [t for t in MED_RESOURCE_TYPES if resources.get(t)]
+    med_lookup    = _build_medication_lookup(resources)
     counts: dict  = defaultdict(lambda: defaultdict(int))
 
     for rtype in present_types:
         for resource in resources[rtype]:
-            for key in _extract_med_codings(resource, rtype):
+            for key in _extract_med_codings(resource, rtype, med_lookup):
                 counts[key][rtype] += 1
 
     rows = [
@@ -1554,22 +1623,39 @@ def _ref_id(reference: str, expected_type: str = "") -> str:
     return ""
 
 
-def _all_med_codes(resource: dict, rtype: str) -> list:
+def _all_med_codes(resource: dict, rtype: str,
+                   med_lookup: dict | None = None) -> list:
     """
-    Return every distinct code value found in the medication CodeableConcept
-    for a MedicationRequest or MedicationAdministration resource.
-    Uses all codings, not just the first.
+    Return every distinct code value for a medication resource.
+
+    Checks both the inline CodeableConcept AND any medicationReference so
+    that RxNorm codes stored on a separate Medication resource are captured.
+    Deduplicates on code value.
     """
-    cc = (resource.get("code")
-          if rtype == "Medication"
-          else resource.get("medicationCodeableConcept"))
+    seen  = set()
     codes = []
-    if isinstance(cc, dict):
+
+    def _add_from_cc(cc):
+        if not isinstance(cc, dict):
+            return
         for coding in cc.get("coding", []):
             if isinstance(coding, dict):
                 code = (coding.get("code") or "").strip()
-                if code:
+                if code and code not in seen:
+                    seen.add(code)
                     codes.append(code)
+
+    # 1 — inline CodeableConcept
+    _add_from_cc(resource.get("code") if rtype == "Medication"
+                 else resource.get("medicationCodeableConcept"))
+
+    # 2 — referenced Medication resource
+    if med_lookup is not None:
+        for _, code, _ in _resolve_med_ref(resource, med_lookup):
+            if code and code not in seen:
+                seen.add(code)
+                codes.append(code)
+
     return codes
 
 
@@ -1602,7 +1688,12 @@ def build_patient_medication_map(resources: dict) -> tuple:
         if pid:
             encounter_to_patient[eid] = pid
 
-    # ── Step 2: walk medication resources and collect codes per patient ────────
+    # ── Step 2: build Medication resource lookup for reference resolution ────────
+    # Resolves medicationReference pointers so RxNorm codes on separate
+    # Medication resources are included alongside any inline PCC/local codes.
+    med_lookup = _build_medication_lookup(resources)
+
+    # ── Step 3: walk medication resources and collect codes per patient ────────
     # patient_id → set of code strings (deduped per patient)
     patient_codes: dict[str, set] = defaultdict(set)
     unresolved = 0
@@ -1639,7 +1730,7 @@ def build_patient_medication_map(resources: dict) -> tuple:
                 continue
 
             # --- collect codes ---
-            for code in _all_med_codes(r, rtype):
+            for code in _all_med_codes(r, rtype, med_lookup):
                 patient_codes[pid].add(code)
 
     # ── Step 3: flatten to rows ───────────────────────────────────────────────
