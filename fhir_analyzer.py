@@ -1626,24 +1626,25 @@ def _ref_id(reference: str, expected_type: str = "") -> str:
 def _all_med_codes(resource: dict, rtype: str,
                    med_lookup: dict | None = None) -> list:
     """
-    Return every distinct code value for a medication resource.
+    Return every distinct (system, code) pair for a medication resource.
 
     Checks both the inline CodeableConcept AND any medicationReference so
     that RxNorm codes stored on a separate Medication resource are captured.
-    Deduplicates on code value.
+    Deduplicates on (system, code).
     """
-    seen  = set()
-    codes = []
+    seen   = set()
+    tuples = []
 
     def _add_from_cc(cc):
         if not isinstance(cc, dict):
             return
         for coding in cc.get("coding", []):
             if isinstance(coding, dict):
-                code = (coding.get("code") or "").strip()
-                if code and code not in seen:
-                    seen.add(code)
-                    codes.append(code)
+                system = (coding.get("system") or "").strip()
+                code   = (coding.get("code")   or "").strip()
+                if (system or code) and (system, code) not in seen:
+                    seen.add((system, code))
+                    tuples.append((system, code))
 
     # 1 — inline CodeableConcept
     _add_from_cc(resource.get("code") if rtype == "Medication"
@@ -1651,12 +1652,12 @@ def _all_med_codes(resource: dict, rtype: str,
 
     # 2 — referenced Medication resource
     if med_lookup is not None:
-        for _, code, _ in _resolve_med_ref(resource, med_lookup):
-            if code and code not in seen:
-                seen.add(code)
-                codes.append(code)
+        for system, code, _ in _resolve_med_ref(resource, med_lookup):
+            if (system, code) not in seen:
+                seen.add((system, code))
+                tuples.append((system, code))
 
-    return codes
+    return tuples
 
 
 def build_patient_medication_map(resources: dict) -> tuple:
@@ -1693,8 +1694,8 @@ def build_patient_medication_map(resources: dict) -> tuple:
     # Medication resources are included alongside any inline PCC/local codes.
     med_lookup = _build_medication_lookup(resources)
 
-    # ── Step 3: walk medication resources and collect codes per patient ────────
-    # patient_id → set of code strings (deduped per patient)
+    # ── Step 3: walk medication resources and collect (system, code) per patient ─
+    # patient_id → set of (system, code) tuples (deduped per patient)
     patient_codes: dict[str, set] = defaultdict(set)
     unresolved = 0
 
@@ -1729,19 +1730,19 @@ def build_patient_medication_map(resources: dict) -> tuple:
                 unresolved += 1
                 continue
 
-            # --- collect codes ---
-            for code in _all_med_codes(r, rtype, med_lookup):
-                patient_codes[pid].add(code)
+            # --- collect (system, code) pairs ---
+            for system, code in _all_med_codes(r, rtype, med_lookup):
+                patient_codes[pid].add((system, code))
 
-    # ── Step 3: flatten to rows ───────────────────────────────────────────────
-    rows = [
-        {
-            "patient_id":        pid,
-            "medication_codes":  ", ".join(sorted(codes)),
-            "code_count":        len(codes),
-        }
-        for pid, codes in sorted(patient_codes.items())
-    ]
+    # ── Step 4: flatten to one row per (patient_id, system, code) ────────────
+    rows = []
+    for pid, code_pairs in sorted(patient_codes.items()):
+        for system, code in sorted(code_pairs):
+            rows.append({
+                "patient_id": pid,
+                "code_system": system,
+                "code":        code,
+            })
 
     return rows, unresolved
 
@@ -1750,15 +1751,12 @@ def build_patient_medication_map(resources: dict) -> tuple:
 
 def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> None:
     """
-    Two primary columns: Patient ID | Medication Codes (comma-delimited).
-    A third helper column shows the count of distinct codes per patient.
+    One row per (patient_id, code_system, code).
+    Patient ID stripes change when the patient changes so it's easy to scan
+    which codes belong to the same patient.
     """
-    HDR = [
-        "Patient ID",
-        "Medication Codes\n(comma-delimited, distinct)",
-        "Distinct\nCode Count",
-    ]
-    ws.row_dimensions[1].height = 36
+    HDR = ["Patient ID", "Code System", "Medication Code"]
+    ws.row_dimensions[1].height = 28
     for ci, h in enumerate(HDR, 1):
         cell = ws.cell(row=1, column=ci, value=h)
         cell.font      = _font(bold=True, color=_C["hdr_fg"])
@@ -1771,45 +1769,49 @@ def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> Non
         ws.cell(row=2, column=1).font = _font(color=_C["no_fg"])
         return
 
+    prev_pid     = None
+    stripe_color = _C["stripe_a"]
+
     for ri, row in enumerate(rows, 2):
         ws.row_dimensions[ri].height = 15
-        stripe = _fill(_C["stripe_a"]) if ri % 2 == 0 else _fill(_C["stripe_b"])
 
-        pid_cell = ws.cell(row=ri, column=1, value=row["patient_id"])
-        pid_cell.fill = stripe; pid_cell.alignment = LEFT; pid_cell.font = _font()
+        # Alternate stripe each time the patient ID changes so rows for the
+        # same patient are visually grouped
+        if row["patient_id"] != prev_pid:
+            stripe_color = (_C["stripe_a"] if stripe_color == _C["stripe_b"]
+                            else _C["stripe_b"])
+            prev_pid = row["patient_id"]
 
-        codes_cell = ws.cell(row=ri, column=2, value=row["medication_codes"])
-        codes_cell.fill = stripe; codes_cell.alignment = LEFT; codes_cell.font = _font()
-        # Wrap so long code lists don't overflow visually
-        codes_cell.alignment = Alignment(horizontal="left", vertical="top",
-                                         wrap_text=True)
+        # Highlight rows whose system is one of the standard three
+        if row["code_system"] in STANDARD_SYSTEMS:
+            stripe = _fill(_C["std_bg"])
+        else:
+            stripe = _fill(stripe_color)
 
-        cnt_cell = ws.cell(row=ri, column=3, value=row["code_count"])
-        cnt_cell.fill = stripe; cnt_cell.alignment = CENTER
-        cnt_cell.font = _font(); cnt_cell.number_format = NUMFMT
+        for ci, val in enumerate(
+                [row["patient_id"], row["code_system"], row["code"]], 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.fill      = stripe
+            cell.alignment = LEFT
+            cell.font      = _font()
 
-    # Auto-height is not supported in openpyxl — set a taller default for
-    # code rows so wrapped text is readable; users can auto-fit manually.
-    for ri in range(2, len(rows) + 2):
-        ws.row_dimensions[ri].height = 30
-
-    # Summary / metadata footer
-    footer_row = len(rows) + 3
+    # Summary footer
+    n_patients = len({r["patient_id"] for r in rows})
+    footer_row  = len(rows) + 3
     ws.row_dimensions[footer_row].height = 18
-
-    summary_pairs = [
-        (1, f"Total patients: {len(rows):,}"),
-        (2, f"Unresolved medication resources (no patient ID found): {unresolved_count:,}"),
-    ]
-    for ci, text in summary_pairs:
+    for ci, text in [
+        (1, f"Total patients: {n_patients:,}"),
+        (2, f"Total (patient, system, code) rows: {len(rows):,}"),
+        (3, f"Unresolved med resources: {unresolved_count:,}"),
+    ]:
         cell = ws.cell(row=footer_row, column=ci, value=text)
         cell.font = _font(bold=True, color=_C["hdr_fg"])
         cell.fill = _fill(_C["summary_hdr"])
         cell.alignment = LEFT
 
     ws.column_dimensions["A"].width = 38
-    ws.column_dimensions["B"].width = 80
-    ws.column_dimensions["C"].width = 14
+    ws.column_dimensions["B"].width = 55
+    ws.column_dimensions["C"].width = 24
     ws.freeze_panes = "A2"
 
 
@@ -1959,8 +1961,9 @@ def main() -> None:
         f"Inventory:   {len(inventory_rows):,} distinct element paths across all types\n"
         f"Dose/Route:  {len(dose_route_detail):,} dosage entries  |  "
         f"{len(dose_route_missing):,} resources flagged missing\n"
-        f"Patient map: {len(patient_med_rows):,} patients  |  "
-        f"{unresolved_count:,} unresolvable med resources\n"
+        f"Patient map: {len({r['patient_id'] for r in patient_med_rows}):,} patients  |  "
+        f"{len(patient_med_rows):,} (patient, system, code) rows  |  "
+        f"{unresolved_count:,} unresolvable\n"
         f"Report:      {output_path.resolve()}"
     )
 
