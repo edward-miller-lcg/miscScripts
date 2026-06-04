@@ -1524,6 +1524,204 @@ def write_missing_dose_route_sheet(ws, missing_rows: list) -> None:
     ws.freeze_panes = "A2"
 
 
+# ── Patient → Medication map ──────────────────────────────────────────────────
+#
+# Memory note: this pass works entirely on the resources dict that is already
+# held in memory from the initial load.  If dataset size becomes a concern the
+# natural optimisation is a second streaming pass over the ndjson files instead
+# of keeping all resources in RAM — the logic below is written to make that
+# refactor straightforward (no state beyond the two dicts built here).
+
+def _ref_id(reference: str, expected_type: str = "") -> str:
+    """
+    Extract the logical ID from a FHIR reference string.
+
+    Handles:
+      "Patient/abc123"                     → "abc123"  (expected_type="Patient")
+      "https://server/fhir/Patient/abc123" → "abc123"  (expected_type="Patient")
+      "abc123"                             → "abc123"  (no type prefix, any type)
+
+    Returns "" if the reference does not match expected_type (when supplied).
+    """
+    if not reference:
+        return ""
+    parts = reference.rstrip("/").split("/")
+    if len(parts) == 1:
+        # bare ID — accept regardless of expected_type
+        return parts[0]
+    if parts[-2] == expected_type or not expected_type:
+        return parts[-1]
+    return ""
+
+
+def _all_med_codes(resource: dict, rtype: str) -> list:
+    """
+    Return every distinct code value found in the medication CodeableConcept
+    for a MedicationRequest or MedicationAdministration resource.
+    Uses all codings, not just the first.
+    """
+    cc = (resource.get("code")
+          if rtype == "Medication"
+          else resource.get("medicationCodeableConcept"))
+    codes = []
+    if isinstance(cc, dict):
+        for coding in cc.get("coding", []):
+            if isinstance(coding, dict):
+                code = (coding.get("code") or "").strip()
+                if code:
+                    codes.append(code)
+    return codes
+
+
+def build_patient_medication_map(resources: dict) -> tuple:
+    """
+    Build a per-patient medication code inventory from MedicationRequest and
+    MedicationAdministration resources.
+
+    Patient ID resolution order for each medication resource:
+      1. subject.reference  → parsed as "Patient/{id}"
+      2. subject.reference  → parsed as "Encounter/{id}", then encounter→patient map
+      3. encounter.reference on the resource → encounter→patient map
+
+    Returns:
+        rows            — list of {patient_id, medication_codes} sorted by patient_id
+        unresolved_count— number of medication resources whose patient could not be found
+    """
+    # ── Step 1: build Encounter → Patient ID lookup from Encounter resources ──
+    # This is a lightweight pass — we only need subject.reference from each Encounter.
+    encounter_to_patient: dict[str, str] = {}
+    for enc in resources.get("Encounter", []):
+        eid = enc.get("id", "")
+        if not eid:
+            continue
+        subj_ref = ""
+        subj = enc.get("subject")
+        if isinstance(subj, dict):
+            subj_ref = subj.get("reference", "")
+        pid = _ref_id(subj_ref, "Patient")
+        if pid:
+            encounter_to_patient[eid] = pid
+
+    # ── Step 2: walk medication resources and collect codes per patient ────────
+    # patient_id → set of code strings (deduped per patient)
+    patient_codes: dict[str, set] = defaultdict(set)
+    unresolved = 0
+
+    for rtype in ("MedicationRequest", "MedicationAdministration"):
+        for r in resources.get(rtype, []):
+
+            # --- resolve patient ID ---
+            pid = ""
+
+            subj = r.get("subject")
+            if isinstance(subj, dict):
+                ref = subj.get("reference", "")
+
+                # Try direct Patient reference first
+                pid = _ref_id(ref, "Patient")
+
+                # If subject points to an Encounter, walk through the map
+                if not pid:
+                    eid = _ref_id(ref, "Encounter")
+                    if eid:
+                        pid = encounter_to_patient.get(eid, "")
+
+            # Last resort: use the encounter field on the resource itself
+            if not pid:
+                enc_ref = r.get("encounter")
+                if isinstance(enc_ref, dict):
+                    eid = _ref_id(enc_ref.get("reference", ""), "Encounter")
+                    if eid:
+                        pid = encounter_to_patient.get(eid, "")
+
+            if not pid:
+                unresolved += 1
+                continue
+
+            # --- collect codes ---
+            for code in _all_med_codes(r, rtype):
+                patient_codes[pid].add(code)
+
+    # ── Step 3: flatten to rows ───────────────────────────────────────────────
+    rows = [
+        {
+            "patient_id":        pid,
+            "medication_codes":  ", ".join(sorted(codes)),
+            "code_count":        len(codes),
+        }
+        for pid, codes in sorted(patient_codes.items())
+    ]
+
+    return rows, unresolved
+
+
+# ── Sheet: Patient Medication Map ─────────────────────────────────────────────
+
+def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> None:
+    """
+    Two primary columns: Patient ID | Medication Codes (comma-delimited).
+    A third helper column shows the count of distinct codes per patient.
+    """
+    HDR = [
+        "Patient ID",
+        "Medication Codes\n(comma-delimited, distinct)",
+        "Distinct\nCode Count",
+    ]
+    ws.row_dimensions[1].height = 36
+    for ci, h in enumerate(HDR, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill      = _fill(_C["hdr_bg"])
+        cell.alignment = CENTER
+
+    if not rows:
+        ws.cell(row=2, column=1,
+                value="No patient-medication data could be resolved.")
+        ws.cell(row=2, column=1).font = _font(color=_C["no_fg"])
+        return
+
+    for ri, row in enumerate(rows, 2):
+        ws.row_dimensions[ri].height = 15
+        stripe = _fill(_C["stripe_a"]) if ri % 2 == 0 else _fill(_C["stripe_b"])
+
+        pid_cell = ws.cell(row=ri, column=1, value=row["patient_id"])
+        pid_cell.fill = stripe; pid_cell.alignment = LEFT; pid_cell.font = _font()
+
+        codes_cell = ws.cell(row=ri, column=2, value=row["medication_codes"])
+        codes_cell.fill = stripe; codes_cell.alignment = LEFT; codes_cell.font = _font()
+        # Wrap so long code lists don't overflow visually
+        codes_cell.alignment = Alignment(horizontal="left", vertical="top",
+                                         wrap_text=True)
+
+        cnt_cell = ws.cell(row=ri, column=3, value=row["code_count"])
+        cnt_cell.fill = stripe; cnt_cell.alignment = CENTER
+        cnt_cell.font = _font(); cnt_cell.number_format = NUMFMT
+
+    # Auto-height is not supported in openpyxl — set a taller default for
+    # code rows so wrapped text is readable; users can auto-fit manually.
+    for ri in range(2, len(rows) + 2):
+        ws.row_dimensions[ri].height = 30
+
+    # Summary / metadata footer
+    footer_row = len(rows) + 3
+    ws.row_dimensions[footer_row].height = 18
+
+    summary_pairs = [
+        (1, f"Total patients: {len(rows):,}"),
+        (2, f"Unresolved medication resources (no patient ID found): {unresolved_count:,}"),
+    ]
+    for ci, text in summary_pairs:
+        cell = ws.cell(row=footer_row, column=ci, value=text)
+        cell.font = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill = _fill(_C["summary_hdr"])
+        cell.alignment = LEFT
+
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 80
+    ws.column_dimensions["C"].width = 14
+    ws.freeze_panes = "A2"
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1600,6 +1798,12 @@ def main() -> None:
     print("Extracting dose and route data…")
     dose_route_detail, dose_route_missing = extract_dose_route_data(resources)
 
+    print("Building patient → medication map…")
+    patient_med_rows, unresolved_count = build_patient_medication_map(resources)
+    if unresolved_count:
+        print(f"  WARNING: {unresolved_count:,} medication resource(s) could not be "
+              f"linked to a patient (subject.reference missing or unresolvable).")
+
     # ── Expand detail rows ────────────────────────────────────────────────────
     all_detail_rows = []
     for result in results:
@@ -1646,6 +1850,10 @@ def main() -> None:
     ws_miss = wb.create_sheet("Missing Dose or Route")
     write_missing_dose_route_sheet(ws_miss, dose_route_missing)
 
+    # 8 — Patient Medication Map
+    ws_pt = wb.create_sheet("Patient Medication Map")
+    write_patient_medication_sheet(ws_pt, patient_med_rows, unresolved_count)
+
     wb.save(output_path)
 
     # ── Console summary ───────────────────────────────────────────────────────
@@ -1660,6 +1868,8 @@ def main() -> None:
         f"Inventory:   {len(inventory_rows):,} distinct element paths across all types\n"
         f"Dose/Route:  {len(dose_route_detail):,} dosage entries  |  "
         f"{len(dose_route_missing):,} resources flagged missing\n"
+        f"Patient map: {len(patient_med_rows):,} patients  |  "
+        f"{unresolved_count:,} unresolvable med resources\n"
         f"Report:      {output_path.resolve()}"
     )
 
