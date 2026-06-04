@@ -1758,6 +1758,233 @@ def build_patient_medication_map(resources: dict) -> tuple:
     return rows, unresolved
 
 
+# ── Medication code co-occurrence (inferred crosswalk) ───────────────────────
+
+def _codings_for_resource(resource: dict, rtype: str,
+                           med_lookup: dict) -> list:
+    """
+    Return all distinct (system, code, display) tuples for a medication
+    resource, combining the inline CodeableConcept and any resolved
+    medicationReference so that codes from both paths are considered
+    co-occurring.
+    """
+    seen    = set()
+    results = []
+
+    def _add(system, code, display):
+        system  = (system  or "").strip()
+        code    = (code    or "").strip()
+        display = (display or "").strip()
+        if (system or code) and (system, code) not in seen:
+            seen.add((system, code))
+            results.append((system, code, display))
+
+    # 1 — inline CodeableConcept
+    cc_field = "code" if rtype == "Medication" else "medicationCodeableConcept"
+    cc = resource.get(cc_field)
+    if isinstance(cc, dict):
+        for coding in cc.get("coding", []):
+            if isinstance(coding, dict):
+                _add(coding.get("system"),
+                     coding.get("code"),
+                     coding.get("display"))
+
+    # 2 — referenced Medication resource
+    if rtype != "Medication":
+        for sys, code, disp in _resolve_med_ref(resource, med_lookup):
+            _add(sys, code, disp)
+
+    return results
+
+
+def build_code_cooccurrence(resources: dict) -> list:
+    """
+    Walk every Medication, MedicationRequest, and MedicationAdministration
+    resource and find codes that appear together in the same CodeableConcept
+    (or linked via medicationReference).
+
+    Two codes in the same coding[] array are FHIR-equivalent representations
+    of the same concept, so their pairing is an inferred cross-system mapping.
+
+    Returns one row per unique cross-system pair, sorted by co-occurrence
+    count descending.  Same-system pairs are excluded (not useful as a
+    crosswalk).
+    """
+    med_lookup = _build_medication_lookup(resources)
+
+    # key: (sys_a, code_a, sys_b, code_b)  — always normalised so a ≤ b
+    pair_data: dict = defaultdict(lambda: {
+        "count":    0,
+        "disp_a":   "",
+        "disp_b":   "",
+        "rtypes":   set(),
+    })
+
+    for rtype in ("Medication", "MedicationRequest", "MedicationAdministration"):
+        for r in resources.get(rtype, []):
+            codings = _codings_for_resource(r, rtype, med_lookup)
+            if len(codings) < 2:
+                continue
+
+            # Generate all cross-system pairs within this resource
+            for i in range(len(codings)):
+                for j in range(i + 1, len(codings)):
+                    sys_a, code_a, disp_a = codings[i]
+                    sys_b, code_b, disp_b = codings[j]
+
+                    # Skip same-system pairs — not informative as a crosswalk
+                    if sys_a == sys_b:
+                        continue
+
+                    # Normalise order so (A, B) and (B, A) collapse to the same key
+                    if (sys_a, code_a) > (sys_b, code_b):
+                        sys_a, code_a, disp_a, sys_b, code_b, disp_b = (
+                            sys_b, code_b, disp_b, sys_a, code_a, disp_a
+                        )
+
+                    key  = (sys_a, code_a, sys_b, code_b)
+                    data = pair_data[key]
+                    data["count"] += 1
+                    data["rtypes"].add(rtype)
+                    # Keep the most informative display seen
+                    if not data["disp_a"] and disp_a:
+                        data["disp_a"] = disp_a
+                    if not data["disp_b"] and disp_b:
+                        data["disp_b"] = disp_b
+
+    rows = [
+        {
+            "system_a":      sys_a,
+            "code_a":        code_a,
+            "display_a":     data["disp_a"],
+            "system_b":      sys_b,
+            "code_b":        code_b,
+            "display_b":     data["disp_b"],
+            "count":         data["count"],
+            "resource_types": ", ".join(sorted(data["rtypes"])),
+        }
+        for (sys_a, code_a, sys_b, code_b), data in pair_data.items()
+    ]
+
+    # Sort: count desc, then system_a, code_a for stable ordering
+    rows.sort(key=lambda r: (-r["count"], r["system_a"], r["code_a"]))
+    return rows
+
+
+# ── Sheet: Medication Code Crosswalk ─────────────────────────────────────────
+
+def write_code_cooccurrence_sheet(ws, rows: list) -> None:
+    """
+    Each row is a unique cross-system code pair inferred from co-occurrence
+    within the same FHIR CodeableConcept.  Higher count = stronger evidence
+    that the two codes are equivalent.
+    """
+    HDR = [
+        "System A",
+        "Code A",
+        "Display A",
+        "System B",
+        "Code B",
+        "Display B",
+        "Co-occurrence\nCount",
+        "Confidence\nNote",
+        "Found In\n(Resource Types)",
+    ]
+    ws.row_dimensions[1].height = 40
+    for ci, h in enumerate(HDR, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill      = _fill(_C["hdr_bg"])
+        cell.alignment = CENTER
+
+    if not rows:
+        ws.cell(row=2, column=1,
+                value="No cross-system code pairs found — all resources use a "
+                      "single coding system.")
+        return
+
+    # Determine count thresholds for confidence labelling
+    counts      = [r["count"] for r in rows]
+    max_count   = max(counts)
+    high_thresh = max(2, max_count * 0.5)   # top 50 % of max
+    med_thresh  = max(2, max_count * 0.1)   # top 10 %
+
+    def _confidence(count):
+        if count >= high_thresh:
+            return "High"
+        if count >= med_thresh:
+            return "Medium"
+        return "Low"
+
+    for ri, row in enumerate(rows, 2):
+        ws.row_dimensions[ri].height = 15
+
+        a_is_std = row["system_a"] in STANDARD_SYSTEMS
+        b_is_std = row["system_b"] in STANDARD_SYSTEMS
+
+        # Highlight rows where at least one side is a standard system
+        if a_is_std or b_is_std:
+            stripe = _fill(_C["std_bg"])
+        elif ri % 2 == 0:
+            stripe = _fill(_C["stripe_a"])
+        else:
+            stripe = _fill(_C["stripe_b"])
+
+        def put(col, val, align=LEFT, fmt=None):
+            cell = ws.cell(row=ri, column=col, value=val)
+            cell.fill      = stripe
+            cell.alignment = align
+            cell.font      = _font()
+            if fmt:
+                cell.number_format = fmt
+
+        put(1, row["system_a"])
+        put(2, row["code_a"])
+        put(3, row["display_a"])
+        put(4, row["system_b"])
+        put(5, row["code_b"])
+        put(6, row["display_b"])
+        put(7, row["count"],  CENTER, NUMFMT)
+
+        # Confidence cell — colour by level
+        conf  = _confidence(row["count"])
+        cc    = ws.cell(row=ri, column=8, value=conf)
+        cc.alignment = CENTER
+        cc.fill = stripe   # default; override below
+        if conf == "High":
+            cc.fill = _fill(_C["yes_bg"])
+            cc.font = _font(bold=True, color=_C["yes_fg"])
+        elif conf == "Medium":
+            cc.fill = _fill(_C["na_bg"])
+            cc.font = _font(bold=True, color=_C["na_fg"])
+        else:
+            cc.fill = _fill(_C["no_bg"])
+            cc.font = _font(bold=True, color=_C["no_fg"])
+
+        put(9, row["resource_types"], CENTER)
+
+    # Summary footer
+    footer_row = len(rows) + 3
+    ws.row_dimensions[footer_row].height = 18
+    n_std = sum(1 for r in rows
+                if r["system_a"] in STANDARD_SYSTEMS
+                or r["system_b"] in STANDARD_SYSTEMS)
+    for ci, text in [
+        (1, f"Total inferred mappings: {len(rows):,}"),
+        (2, f"Pairs involving RxNorm / SNOMED / LOINC: {n_std:,}"),
+        (7, f"Confidence = relative to max count ({max_count:,})"),
+    ]:
+        cell = ws.cell(row=footer_row, column=ci, value=text)
+        cell.font = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill = _fill(_C["summary_hdr"])
+        cell.alignment = LEFT
+
+    col_widths = [52, 20, 46, 52, 20, 46, 14, 14, 36]
+    for ci, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+
+
 # ── Sheet: Patient Medication Map ─────────────────────────────────────────────
 
 def write_patient_medication_sheet(ws, rows: list, unresolved_count: int) -> None:
@@ -1913,6 +2140,9 @@ def main() -> None:
     print("Extracting dose and route data…")
     dose_route_detail, dose_route_missing = extract_dose_route_data(resources)
 
+    print("Building medication code co-occurrence crosswalk…")
+    cooccurrence_rows = build_code_cooccurrence(resources)
+
     print("Building patient → medication map…")
     patient_med_rows, unresolved_count = build_patient_medication_map(resources)
     if unresolved_count:
@@ -1965,7 +2195,11 @@ def main() -> None:
     ws_miss = wb.create_sheet("Missing Dose or Route")
     write_missing_dose_route_sheet(ws_miss, dose_route_missing)
 
-    # 8 — Patient Medication Map
+    # 8 — Medication Code Crosswalk (inferred from co-occurrence)
+    ws_xwalk = wb.create_sheet("Med Code Crosswalk")
+    write_code_cooccurrence_sheet(ws_xwalk, cooccurrence_rows)
+
+    # 9 — Patient Medication Map
     ws_pt = wb.create_sheet("Patient Medication Map")
     write_patient_medication_sheet(ws_pt, patient_med_rows, unresolved_count)
 
@@ -1983,6 +2217,7 @@ def main() -> None:
         f"Inventory:   {len(inventory_rows):,} distinct element paths across all types\n"
         f"Dose/Route:  {len(dose_route_detail):,} dosage entries  |  "
         f"{len(dose_route_missing):,} resources flagged missing\n"
+        f"Crosswalk:   {len(cooccurrence_rows):,} inferred cross-system code pairs\n"
         f"Patient map: {len({r['patient_id'] for r in patient_med_rows}):,} patients  |  "
         f"{len(patient_med_rows):,} (patient × system) rows  |  "
         f"{unresolved_count:,} unresolvable\n"
