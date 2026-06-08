@@ -298,13 +298,33 @@ def extract_ethnicity_systems(resource: dict) -> list:
 # ── Check definitions ────────────────────────────────────────────────────────
 
 def chk(resource_type, element, value_set, check_fn,
-        extract_systems_fn=None, is_status=False, status_path=None):
+        extract_systems_fn=None, is_status=False, status_path=None,
+        expected_systems=None):
+    """
+    expected_systems: set of code system URIs that are considered correct /
+    expected for this specific element binding.  Used to compute
+    "N Using Expected System" — a per-element correctness metric that is
+    more meaningful than the generic RxNorm/SNOMED/LOINC count for elements
+    whose binding calls for a different system (e.g. SOPT for Coverage.type,
+    LOINC for Observation.code, HL7 v3 for category codes).
+    """
     return dict(
         resource_type=resource_type, element=element, value_set=value_set,
         check_fn=check_fn, extract_systems_fn=extract_systems_fn,
         is_status=is_status, status_path=status_path,
+        expected_systems=frozenset(expected_systems) if expected_systems else None,
     )
 
+
+_RXNORM  = {"http://www.nlm.nih.gov/research/umls/rxnorm"}
+_LOINC   = {"http://loinc.org"}
+_SNOMED  = {"http://snomed.info/sct"}
+_SOPT    = {"https://nahdo.org/sopt"}
+_OMB     = {"urn:oid:2.16.840.1.113883.6.238"}
+_OBS_CAT = {"http://terminology.hl7.org/CodeSystem/observation-category"}
+_MR_CAT  = {"http://terminology.hl7.org/CodeSystem/medicationrequest-category"}
+_ADMIT   = {"http://terminology.hl7.org/CodeSystem/admit-source"}
+_DISCH   = {"http://terminology.hl7.org/CodeSystem/discharge-disposition"}
 
 CHECKS = [
     # ── Coverage ─────────────────────────────────────────────────────────────
@@ -317,17 +337,20 @@ CHECKS = [
     chk("Coverage", "Coverage.type",
         "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.114222.4.11.3591",
         lambda r: field_present(r, "type"),
-        extract_systems_fn=lambda r: cc_systems(r, "type")),
+        extract_systems_fn=lambda r: cc_systems(r, "type"),
+        expected_systems=_SOPT),
 
     # ── Encounter ─────────────────────────────────────────────────────────────
     chk("Encounter", "Encounter.hospitalization.admitSource",
         "https://hl7.org/fhir/R4/valueset-encounter-admit-source.html",
         lambda r: field_present(r, "hospitalization.admitSource"),
-        extract_systems_fn=lambda r: cc_systems(r, "hospitalization.admitSource")),
+        extract_systems_fn=lambda r: cc_systems(r, "hospitalization.admitSource"),
+        expected_systems=_ADMIT),
     chk("Encounter", "Encounter.hospitalization.dischargeDisposition",
         "https://terminology.hl7.org/6.1.0/ValueSet-clinical-discharge-disposition.html",
         lambda r: field_present(r, "hospitalization.dischargeDisposition"),
-        extract_systems_fn=lambda r: cc_systems(r, "hospitalization.dischargeDisposition")),
+        extract_systems_fn=lambda r: cc_systems(r, "hospitalization.dischargeDisposition"),
+        expected_systems=_DISCH),
     chk("Encounter", "Encounter.period", "",
         lambda r: field_present(r, "period")),
     chk("Encounter", "Encounter.period.end", "",
@@ -339,7 +362,8 @@ CHECKS = [
     chk("Medication", "Medication.code",
         "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113762.1.4.1010.4",
         lambda r: field_present(r, "code"),
-        extract_systems_fn=lambda r: cc_systems(r, "code")),
+        extract_systems_fn=lambda r: cc_systems(r, "code"),
+        expected_systems=_RXNORM),
     chk("Medication", "Medication.status",
         "http://hl7.org/fhir/R4/valueset-medication-status.html",
         lambda r: field_present(r, "status"),
@@ -349,7 +373,8 @@ CHECKS = [
     chk("MedicationAdministration", "MedicationAdministration.dosage.route",
         "http://hl7.org/fhir/ValueSet/route-codes",
         lambda r: field_present(r, "dosage.route"),
-        extract_systems_fn=lambda r: cc_systems(r, "dosage.route")),
+        extract_systems_fn=lambda r: cc_systems(r, "dosage.route"),
+        expected_systems=_SNOMED),
     chk("MedicationAdministration", "MedicationAdministration.effective[x]", "",
         lambda r: poly_present(r, "effectiveDateTime", "effectivePeriod")),
     chk("MedicationAdministration", "MedicationAdministration.effectivePeriod.end", "",
@@ -359,7 +384,8 @@ CHECKS = [
     chk("MedicationAdministration", "MedicationAdministration.medication[x]",
         "https://vsac.nlm.nih.gov/valueset/2.16.840.1.113762.1.4.1010.4/expansion",
         lambda r: poly_present(r, "medicationCodeableConcept", "medicationReference"),
-        extract_systems_fn=lambda r: poly_cc_systems(r, "medicationCodeableConcept")),
+        extract_systems_fn=lambda r: poly_cc_systems(r, "medicationCodeableConcept"),
+        expected_systems=_RXNORM),
 
     # ── MedicationRequest ─────────────────────────────────────────────────────
     chk("MedicationRequest", "MedicationRequest.authoredOn", "",
@@ -367,11 +393,13 @@ CHECKS = [
     chk("MedicationRequest", "MedicationRequest.category",
         "http://hl7.org/fhir/ValueSet/medicationrequest-category",
         lambda r: field_present(r, "category"),
-        extract_systems_fn=lambda r: cc_systems(r, "category")),
+        extract_systems_fn=lambda r: cc_systems(r, "category"),
+        expected_systems=_MR_CAT),
     chk("MedicationRequest", "MedicationRequest.dosageInstruction.route",
         "https://hl7.org/fhir/valueset-route-codes.html",
         lambda r: field_present(r, "dosageInstruction.route"),
-        extract_systems_fn=lambda r: cc_systems(r, "dosageInstruction.route")),
+        extract_systems_fn=lambda r: cc_systems(r, "dosageInstruction.route"),
+        expected_systems=_SNOMED),
     chk("MedicationRequest", "MedicationRequest.dosageInstruction.Timing", "",
         lambda r: field_present(r, "dosageInstruction.timing")),
     chk("MedicationRequest", "MedicationRequest.dosageInstruction.Timing.boundsPeriod.end", "",
@@ -381,7 +409,8 @@ CHECKS = [
     chk("MedicationRequest", "MedicationRequest.medication[x]",
         "http://cts.nlm.nih.gov/fhir/ValueSet/2.16.840.1.113762.1.4.1010.4",
         lambda r: poly_present(r, "medicationCodeableConcept", "medicationReference"),
-        extract_systems_fn=lambda r: poly_cc_systems(r, "medicationCodeableConcept")),
+        extract_systems_fn=lambda r: poly_cc_systems(r, "medicationCodeableConcept"),
+        expected_systems=_RXNORM),
     chk("MedicationRequest", "MedicationRequest.requester", "",
         lambda r: field_present(r, "requester")),
 
@@ -389,21 +418,25 @@ CHECKS = [
     chk("Observation", "Observation.category",
         "http://hl7.org/fhir/valueset-observation-category.html",
         lambda r: field_present(r, "category"),
-        extract_systems_fn=lambda r: cc_systems(r, "category")),
+        extract_systems_fn=lambda r: cc_systems(r, "category"),
+        expected_systems=_OBS_CAT),
     chk("Observation", "Observation.category:Laboratory",
         "http://hl7.org/fhir/us/core/ValueSet-us-core-clinical-result-observation-category.html",
         category_lab_present,
-        extract_systems_fn=lambda r: cc_systems(r, "category")),
+        extract_systems_fn=lambda r: cc_systems(r, "category"),
+        expected_systems=_OBS_CAT),
     chk("Observation", "Observation.code",
         "http://hl7.org/fhir/us/core/ValueSet/us-core-laboratory-test-codes",
         lambda r: field_present(r, "code"),
-        extract_systems_fn=lambda r: cc_systems(r, "code")),
+        extract_systems_fn=lambda r: cc_systems(r, "code"),
+        expected_systems=_LOINC),
     chk("Observation", "Observation.component", "",
         lambda r: field_present(r, "component")),
     chk("Observation", "Observation.component.code",
         "http://hl7.org/fhir/ValueSet/observation-codes",
         lambda r: field_present(r, "component.code"),
-        extract_systems_fn=lambda r: cc_systems(r, "component.code")),
+        extract_systems_fn=lambda r: cc_systems(r, "component.code"),
+        expected_systems=_LOINC),
     chk("Observation", "Observation.component.value[x]", "",
         component_value_present),
     chk("Observation", "Observation.effective[x]", "",
@@ -428,14 +461,16 @@ CHECKS = [
     chk("Patient", "Patient.extension (race)",
         "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race",
         lambda r: extension_present(r, "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race"),
-        extract_systems_fn=extract_race_systems),
+        extract_systems_fn=extract_race_systems,
+        expected_systems=_OMB),
     chk("Patient", "Patient.extension (sex at birth)",
         "http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex",
         lambda r: extension_present(r, "http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex")),
     chk("Patient", "Patient.extension:ethnicity",
         "https://hl7.org/fhir/us/core/STU6.1/ValueSet-omb-ethnicity-category.html",
         lambda r: extension_present(r, "http://hl7.org/fhir/us/core/StructureDefinition/us-core-ethnicity"),
-        extract_systems_fn=extract_ethnicity_systems),
+        extract_systems_fn=extract_ethnicity_systems,
+        expected_systems=_OMB),
     chk("Patient", "Patient.identifier", "",
         lambda r: field_present(r, "identifier")),
     chk("Patient", "Patient.name", "",
@@ -451,13 +486,15 @@ CHECKS = [
     chk("Specimen", "Specimen.collection.bodySite",
         "http://hl7.org/fhir/valueset-body-site.html",
         lambda r: field_present(r, "collection.bodySite"),
-        extract_systems_fn=lambda r: cc_systems(r, "collection.bodySite")),
+        extract_systems_fn=lambda r: cc_systems(r, "collection.bodySite"),
+        expected_systems=_SNOMED),
     chk("Specimen", "Specimen.collection.collected[x]", "",
         collected_x_present),
     chk("Specimen", "Specimen.type",
         "https://vsac.nlm.nih.gov/valueset/2.16.840.1.113762.1.4.1099.54/expansion",
         lambda r: field_present(r, "type"),
-        extract_systems_fn=lambda r: cc_systems(r, "type")),
+        extract_systems_fn=lambda r: cc_systems(r, "type"),
+        expected_systems=_SNOMED),
 ]
 
 
@@ -536,7 +573,7 @@ def analyze(resources: dict) -> list:
                 **check,
                 "total": 0, "missing": 0, "present": "N/A",
                 "system_counts": {}, "status_counts": {},
-                "n_standard": 0, "n_recognized": 0,
+                "n_standard": 0, "n_recognized": 0, "n_expected": 0,
             })
             continue
 
@@ -545,6 +582,8 @@ def analyze(resources: dict) -> list:
         sta_counts   = defaultdict(int)
         n_standard   = 0
         n_recognized = 0
+        n_expected   = 0
+        exp_sys      = check.get("expected_systems")  # frozenset or None
 
         for r in rlist:
             if not check["check_fn"](r):
@@ -558,6 +597,8 @@ def analyze(resources: dict) -> list:
                     n_standard += 1
                 if any(is_recognized(s) for s in systems):
                     n_recognized += 1
+                if exp_sys and any(s in exp_sys for s in systems):
+                    n_expected += 1
 
             if check["is_status"] and check["status_path"]:
                 val = navigate(r, check["status_path"])
@@ -573,6 +614,7 @@ def analyze(resources: dict) -> list:
             "status_counts": dict(sta_counts),
             "n_standard":    n_standard,
             "n_recognized":  n_recognized,
+            "n_expected":    n_expected,
         })
 
     return results
@@ -595,22 +637,26 @@ def expand_result(result: dict, prof_used: str, prof_counts: str) -> list:
         "profiles_count": prof_counts,
     }
 
+    has_exp = bool(result.get("expected_systems"))
+
     if has_vs and not is_stat and has_ext:
         n_std = result["n_standard"]
         n_rec = result["n_recognized"]
+        n_exp = result["n_expected"] if has_exp else None
         p_std = round(n_std / total, 4) if total else 0.0
         std = {
             "n_standard":   n_std,
             "n_recognized": n_rec,
+            "n_expected":   n_exp,
             "proportion":   p_std,
             "opposite":     round(1.0 - p_std, 4),
         }
     elif has_vs and is_stat:
         std = {"n_standard": "N/A", "n_recognized": "N/A",
-               "proportion": "N/A", "opposite": "N/A"}
+               "n_expected": "N/A", "proportion": "N/A", "opposite": "N/A"}
     else:
         std = {"n_standard": None, "n_recognized": None,
-               "proportion": None, "opposite": None}
+               "n_expected": None, "proportion": None, "opposite": None}
 
     rows = []
 
@@ -835,6 +881,7 @@ _C = {
     "na_bg":       "FFEB9C",  "na_fg":   "7D5A00",
     "std_bg":      "E2EFDA",
     "rec_bg":      "EBF3FB",  # softer blue for recognized-system highlight
+    "exp_bg":      "FFF2CC",  # gold/amber for per-element expected-system column
     "summary_hdr": "2E75B6",
     "meta_bg":     "F2F2F2",
 }
@@ -859,25 +906,26 @@ def _font(bold=False, color=None, size=11) -> Font:
 # ── Sheet: FHIR Element Analysis ──────────────────────────────────────────────
 
 DETAIL_HEADERS = [
-    "FHIR Resource\n(QI Core 6.0.0)",          # A
-    "FHIR Data Element",                         # B
-    "FHIR Value Set",                            # C
-    "Total\nResources",                          # D
-    "Count\nMissing",                            # E
-    "Present",                                   # F
-    "N Using\nRxNorm /\nSNOMED / LOINC",        # G  ← strict 3
-    "N Using Any\nRecognized\nSystem",           # H  ← broader set
-    "Proportion\nUsing RxNorm /\nSNOMED / LOINC", # I
-    "Opposite\nProportion",                      # J
-    "Code System\nUsed",                         # K
-    "Use\nCount",                                # L
-    "Status\nUsed",                              # M
-    "Status\nUse Count",                         # N
-    "Profiles Used\n(short name)",               # O
-    "Profiles\nUse Count",                       # P
+    "FHIR Resource\n(QI Core 6.0.0)",              # A
+    "FHIR Data Element",                             # B
+    "FHIR Value Set",                                # C
+    "Total\nResources",                              # D
+    "Count\nMissing",                                # E
+    "Present",                                       # F
+    "N Using\nRxNorm /\nSNOMED / LOINC",            # G  ← strict 3
+    "N Using Any\nRecognized\nSystem",               # H  ← broader set
+    "N Using\nExpected\nSystem",                     # I  ← per-element correct system
+    "Proportion\nUsing RxNorm /\nSNOMED / LOINC",   # J
+    "Opposite\nProportion",                          # K
+    "Code System\nUsed",                             # L
+    "Use\nCount",                                    # M
+    "Status\nUsed",                                  # N
+    "Status\nUse Count",                             # O
+    "Profiles Used\n(short name)",                   # P
+    "Profiles\nUse Count",                           # Q
 ]
 
-DETAIL_COL_WIDTHS = [28, 50, 62, 12, 12, 10, 14, 14, 14, 12, 52, 10, 18, 14, 38, 14]
+DETAIL_COL_WIDTHS = [28, 50, 62, 12, 12, 10, 14, 14, 14, 14, 12, 52, 10, 18, 14, 38, 14]
 
 
 def write_detail_sheet(ws, all_rows: list) -> None:
@@ -927,12 +975,15 @@ def write_detail_sheet(ws, all_rows: list) -> None:
         else:
             pc.fill = _fill(_C["na_bg"]);  pc.font = _font(bold=True, color=_C["na_fg"])
 
-        # Standard-system columns G, H, I, J
+        # System-count columns G–K
+        # exp_bg is gold/amber to distinguish "element-specific correctness"
+        # from the generic standard (green) and recognized (blue) columns
         for col, key, fmt, hi_color in [
             (7,  "n_standard",   NUMFMT, _C["std_bg"]),
             (8,  "n_recognized", NUMFMT, _C["rec_bg"]),
-            (9,  "proportion",   PCTFMT, _C["std_bg"]),
-            (10, "opposite",     PCTFMT, _C["rec_bg"]),
+            (9,  "n_expected",   NUMFMT, _C["exp_bg"]),
+            (10, "proportion",   PCTFMT, _C["std_bg"]),
+            (11, "opposite",     PCTFMT, _C["rec_bg"]),
         ]:
             val = row.get(key)
             cell = ws.cell(row=ri, column=col, value=val)
@@ -949,12 +1000,12 @@ def write_detail_sheet(ws, all_rows: list) -> None:
                 cell.fill = stripe
                 cell.font = _font()
 
-        put(11, row.get("code_system"),   LEFT)
-        put(12, row.get("cs_count"),      CENTER, NUMFMT)
-        put(13, row.get("status_value"),  LEFT)
-        put(14, row.get("status_count"),  CENTER, NUMFMT)
-        put(15, row.get("profiles_used"), LEFT)
-        put(16, row.get("profiles_count"),LEFT)
+        put(12, row.get("code_system"),    LEFT)
+        put(13, row.get("cs_count"),       CENTER, NUMFMT)
+        put(14, row.get("status_value"),   LEFT)
+        put(15, row.get("status_count"),   CENTER, NUMFMT)
+        put(16, row.get("profiles_used"),  LEFT)
+        put(17, row.get("profiles_count"), LEFT)
 
     for ci, w in enumerate(DETAIL_COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
@@ -1758,6 +1809,128 @@ def build_patient_medication_map(resources: dict) -> tuple:
     return rows, unresolved
 
 
+# ── LOINC code inventory ──────────────────────────────────────────────────────
+
+def _find_loinc_codings(data, path: str, results: list) -> None:
+    """
+    Recursively walk a FHIR resource and collect every coding object whose
+    system is http://loinc.org.  Stops descending once a coding is found so
+    we don't re-enter its own fields.
+    Arrays do not increment the path (consistent with Data Inventory behaviour).
+    """
+    if isinstance(data, dict):
+        if data.get("system") == "http://loinc.org":
+            code    = (data.get("code")    or "").strip()
+            display = (data.get("display") or "").strip()
+            if code:
+                # Strip trailing ".coding" from path to show the CC field name
+                display_path = (path[:-len(".coding")]
+                                if path.endswith(".coding") else path)
+                results.append((display_path, code, display))
+            return   # don't recurse further into this coding object
+        for key, value in data.items():
+            new_path = f"{path}.{key}" if path else key
+            _find_loinc_codings(value, new_path, results)
+    elif isinstance(data, list):
+        for item in data:
+            _find_loinc_codings(item, path, results)
+
+
+def build_loinc_inventory(resources: dict) -> list:
+    """
+    Scan all resources for LOINC codings and return one row per unique
+    (resource_type, field_path, loinc_code) combination with count and display.
+    """
+    # {(rtype, path, code): {"display": str, "count": int}}
+    inventory: dict = {}
+
+    for rtype, rlist in resources.items():
+        for r in rlist:
+            hits: list = []
+            _find_loinc_codings(r, "", hits)
+            for path, code, display in hits:
+                key = (rtype, path, code)
+                if key not in inventory:
+                    inventory[key] = {"display": display, "count": 0}
+                inventory[key]["count"] += 1
+                if not inventory[key]["display"] and display:
+                    inventory[key]["display"] = display
+
+    rows = [
+        {
+            "resource_type": rt,
+            "field_path":    path,
+            "loinc_code":    code,
+            "display":       data["display"],
+            "count":         data["count"],
+        }
+        for (rt, path, code), data in inventory.items()
+    ]
+    rows.sort(key=lambda r: (r["resource_type"], -r["count"], r["loinc_code"]))
+    return rows
+
+
+def write_loinc_sheet(ws, rows: list) -> None:
+    """
+    LOINC code inventory: Resource Type | Field Path | LOINC Code | Display | Count
+    """
+    HDR = ["Resource Type", "Field Path", "LOINC Code", "Display", "Count"]
+    ws.row_dimensions[1].height = 28
+    for ci, h in enumerate(HDR, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill      = _fill(_C["hdr_bg"])
+        cell.alignment = CENTER
+
+    if not rows:
+        ws.cell(row=2, column=1, value="No LOINC codes found in this dataset.")
+        return
+
+    prev_rtype   = None
+    stripe_color = _C["stripe_a"]
+
+    for ri, row in enumerate(rows, 2):
+        ws.row_dimensions[ri].height = 15
+        if row["resource_type"] != prev_rtype:
+            stripe_color = (_C["stripe_a"] if stripe_color == _C["stripe_b"]
+                            else _C["stripe_b"])
+            prev_rtype = row["resource_type"]
+
+        stripe = _fill(stripe_color)
+        for ci, (val, align) in enumerate([
+            (row["resource_type"], LEFT),
+            (row["field_path"],    LEFT),
+            (row["loinc_code"],    CENTER),
+            (row["display"],       LEFT),
+            (row["count"],         CENTER),
+        ], 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.fill      = stripe
+            cell.alignment = align
+            cell.font      = _font()
+            if ci == 5:
+                cell.number_format = NUMFMT
+
+    # Totals footer
+    footer = len(rows) + 3
+    ws.row_dimensions[footer].height = 18
+    n_distinct = len({r["loinc_code"] for r in rows})
+    for ci, text in [
+        (1, f"Resource types with LOINC codes: "
+            f"{len({r['resource_type'] for r in rows})}"),
+        (3, f"Distinct LOINC codes: {n_distinct:,}"),
+        (5, f"Total occurrences: {sum(r['count'] for r in rows):,}"),
+    ]:
+        cell = ws.cell(row=footer, column=ci, value=text)
+        cell.font = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill = _fill(_C["summary_hdr"])
+        cell.alignment = LEFT
+
+    for ci, w in enumerate([28, 46, 16, 55, 12], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+
+
 # ── Medication code co-occurrence (inferred crosswalk) ───────────────────────
 
 def _codings_for_resource(resource: dict, rtype: str,
@@ -2140,6 +2313,9 @@ def main() -> None:
     print("Extracting dose and route data…")
     dose_route_detail, dose_route_missing = extract_dose_route_data(resources)
 
+    print("Building LOINC code inventory…")
+    loinc_rows = build_loinc_inventory(resources)
+
     print("Building medication code co-occurrence crosswalk…")
     cooccurrence_rows = build_code_cooccurrence(resources)
 
@@ -2195,7 +2371,11 @@ def main() -> None:
     ws_miss = wb.create_sheet("Missing Dose or Route")
     write_missing_dose_route_sheet(ws_miss, dose_route_missing)
 
-    # 8 — Medication Code Crosswalk (inferred from co-occurrence)
+    # 8 — LOINC Code Inventory
+    ws_loinc = wb.create_sheet("LOINC Codes")
+    write_loinc_sheet(ws_loinc, loinc_rows)
+
+    # 9 — Medication Code Crosswalk (inferred from co-occurrence)
     ws_xwalk = wb.create_sheet("Med Code Crosswalk")
     write_code_cooccurrence_sheet(ws_xwalk, cooccurrence_rows)
 
@@ -2217,6 +2397,8 @@ def main() -> None:
         f"Inventory:   {len(inventory_rows):,} distinct element paths across all types\n"
         f"Dose/Route:  {len(dose_route_detail):,} dosage entries  |  "
         f"{len(dose_route_missing):,} resources flagged missing\n"
+        f"LOINC:       {len({r['loinc_code'] for r in loinc_rows}):,} distinct codes  |  "
+        f"{len(loinc_rows):,} (resource type, field, code) entries\n"
         f"Crosswalk:   {len(cooccurrence_rows):,} inferred cross-system code pairs\n"
         f"Patient map: {len({r['patient_id'] for r in patient_med_rows}):,} patients  |  "
         f"{len(patient_med_rows):,} (patient × system) rows  |  "
