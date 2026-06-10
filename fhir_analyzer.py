@@ -680,25 +680,52 @@ def expand_result(result: dict, prof_used: str, prof_counts: str) -> list:
 
 # ── Category codes ────────────────────────────────────────────────────────────
 
+# Resource types that have additional/alternate "category-like" fields
+# beyond the standard `.category` (CodeableConcept array).
+_CATEGORY_FIELDS = {
+    "Encounter": ["category", "type", "class"],
+}
+
+
+def _iter_codings(value):
+    """
+    Yield (system, code) pairs from a value that may be a Coding, a
+    CodeableConcept, or a list of either (e.g. Encounter.class is a
+    single Coding, Encounter.type is a list of CodeableConcept).
+    """
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_codings(item)
+    elif isinstance(value, dict):
+        if "coding" in value:
+            for coding in value.get("coding", []):
+                if isinstance(coding, dict):
+                    system = (coding.get("system") or "").strip()
+                    code   = (coding.get("code")   or "").strip()
+                    if system or code:
+                        yield (system, code)
+        elif "system" in value or "code" in value:
+            system = (value.get("system") or "").strip()
+            code   = (value.get("code")   or "").strip()
+            if system or code:
+                yield (system, code)
+
+
 def collect_category_codes(resources: dict) -> dict:
     """
-    For each resource type, collect (system, code) pairs from
-    category.coding[].  Returns {rtype: {(system, code): count}}.
+    For each resource type, collect (field, system, code) tuples from
+    category-like fields (category.coding[], plus per-type extras such
+    as Encounter.type and Encounter.class).
+    Returns {rtype: {(field, system, code): count}}.
     """
     out = {}
     for rtype, rlist in resources.items():
         counts = defaultdict(int)
+        fields = _CATEGORY_FIELDS.get(rtype, ["category"])
         for r in rlist:
-            for cat in r.get("category", []):
-                if not isinstance(cat, dict):
-                    continue
-                for coding in cat.get("coding", []):
-                    if not isinstance(coding, dict):
-                        continue
-                    system = (coding.get("system") or "").strip()
-                    code   = (coding.get("code")   or "").strip()
-                    if system or code:
-                        counts[(system, code)] += 1
+            for field in fields:
+                for system, code in _iter_codings(r.get(field)):
+                    counts[(field, system, code)] += 1
         if counts:
             out[rtype] = dict(counts)
     return out
@@ -774,18 +801,19 @@ def _build_medication_lookup(resources: dict) -> dict:
     """
     lookup: dict = {}
     for med in resources.get("Medication", []):
-        mid = med.get("id", "")
+        mid = (med.get("id", "") or "").rstrip("/").split("/")[-1]
         if not mid:
             continue
         codings = []
         cc = med.get("code")
         if isinstance(cc, dict):
+            cc_text = (cc.get("text") or "").strip()
             for coding in cc.get("coding", []):
                 if not isinstance(coding, dict):
                     continue
                 system  = (coding.get("system")  or "").strip()
                 code    = (coding.get("code")    or "").strip()
-                display = (coding.get("display") or "").strip()
+                display = (coding.get("display") or "").strip() or cc_text
                 if system or code:
                     codings.append((system, code, display))
         lookup[mid] = codings
@@ -825,12 +853,13 @@ def _extract_med_codings(resource: dict, rtype: str,
     def _add_from_cc(cc):
         if not isinstance(cc, dict):
             return
+        cc_text = (cc.get("text") or "").strip()
         for coding in cc.get("coding", []):
             if not isinstance(coding, dict):
                 continue
             system  = (coding.get("system")  or "").strip()
             code    = (coding.get("code")    or "").strip()
-            display = (coding.get("display") or "").strip()
+            display = (coding.get("display") or "").strip() or cc_text
             if (system or code) and (system, code) not in seen:
                 seen.add((system, code))
                 results.append((system, code, display))
@@ -1158,7 +1187,7 @@ def write_category_codes_sheet(ws, category_data: dict) -> None:
     One row per (resource_type, system, code) combination.
     Sorted by resource type then count descending.
     """
-    HDR = ["Resource Type", "Category System", "Category Code", "Count"]
+    HDR = ["Resource Type", "Source Field", "Category System", "Category Code", "Count"]
     ws.row_dimensions[1].height = 28
     for ci, h in enumerate(HDR, 1):
         cell = ws.cell(row=1, column=ci, value=h)
@@ -1173,29 +1202,29 @@ def write_category_codes_sheet(ws, category_data: dict) -> None:
     # Flatten and sort
     flat_rows = []
     for rtype, counts in category_data.items():
-        for (system, code), cnt in counts.items():
-            flat_rows.append((rtype, system, code, cnt))
-    flat_rows.sort(key=lambda x: (x[0], -x[3]))
+        for (field, system, code), cnt in counts.items():
+            flat_rows.append((rtype, field, system, code, cnt))
+    flat_rows.sort(key=lambda x: (x[0], x[1], -x[4]))
 
     prev_rtype   = None
     stripe_color = _C["stripe_a"]
 
-    for ri, (rtype, system, code, cnt) in enumerate(flat_rows, 2):
+    for ri, (rtype, field, system, code, cnt) in enumerate(flat_rows, 2):
         ws.row_dimensions[ri].height = 16
         if rtype != prev_rtype:
             stripe_color = _C["stripe_a"] if stripe_color == _C["stripe_b"] else _C["stripe_b"]
             prev_rtype = rtype
 
         stripe = _fill(stripe_color)
-        for ci, val in enumerate([rtype, system, code], 1):
+        for ci, val in enumerate([rtype, field, system, code], 1):
             cell = ws.cell(row=ri, column=ci, value=val)
             cell.fill = stripe; cell.alignment = LEFT; cell.font = _font()
 
-        cnt_cell = ws.cell(row=ri, column=4, value=cnt)
+        cnt_cell = ws.cell(row=ri, column=5, value=cnt)
         cnt_cell.fill = stripe; cnt_cell.alignment = CENTER
         cnt_cell.font = _font(); cnt_cell.number_format = NUMFMT
 
-    for ci, w in enumerate([28, 58, 24, 12], 1):
+    for ci, w in enumerate([28, 16, 58, 24, 12], 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
     ws.freeze_panes = "A2"
 
@@ -1956,11 +1985,12 @@ def _codings_for_resource(resource: dict, rtype: str,
     cc_field = "code" if rtype == "Medication" else "medicationCodeableConcept"
     cc = resource.get(cc_field)
     if isinstance(cc, dict):
+        cc_text = (cc.get("text") or "").strip()
         for coding in cc.get("coding", []):
             if isinstance(coding, dict):
                 _add(coding.get("system"),
                      coding.get("code"),
-                     coding.get("display"))
+                     coding.get("display") or cc_text)
 
     # 2 — referenced Medication resource
     if rtype != "Medication":
