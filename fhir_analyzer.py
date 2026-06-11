@@ -1722,6 +1722,9 @@ def extract_antibiotic_order_window(resources: dict) -> list:
       - dosageInstruction.text (the "sig")→ free-text duration, e.g. "x 5 days",
                                              used as a last-resort fallback
 
+    Also captures MedicationRequest.authoredOn (when the order was placed) as
+    a fallback start date when boundsPeriod.start is absent.
+
     Returns one row per dosageInstruction entry (or one placeholder row for
     MedicationRequests with no dosageInstruction at all).
     """
@@ -1731,6 +1734,7 @@ def extract_antibiotic_order_window(resources: dict) -> list:
         rid                          = r.get("id", "")
         med_sys, med_code, med_disp  = _primary_med_code(r, "MedicationRequest")
         dosage_instructions          = r.get("dosageInstruction") or []
+        authored_on                  = (r.get("authoredOn") or "").strip()
 
         if not dosage_instructions:
             rows.append({
@@ -1738,9 +1742,12 @@ def extract_antibiotic_order_window(resources: dict) -> list:
                 "med_system": med_sys, "med_code": med_code, "med_display": med_disp,
                 "dosage_index": None,
                 "start_date": "", "end_date": "",
+                "authored_on": authored_on,
                 "bounds_duration_value": None, "bounds_duration_unit": "",
                 "sig_text": "", "parsed_duration": "",
-                "has_start": False, "has_end_or_duration": False,
+                "has_start": bool(authored_on),
+                "has_end_or_duration": False,
+                "start_source": "authoredOn" if authored_on else "None",
                 "end_source": "None",
             })
             continue
@@ -1762,6 +1769,13 @@ def extract_antibiotic_order_window(resources: dict) -> list:
             sig_text         = (di.get("text") or "").strip()
             parsed_duration  = _parse_duration_from_text(sig_text)
 
+            if start:
+                start_source = "boundsPeriod.start"
+            elif authored_on:
+                start_source = "authoredOn"
+            else:
+                start_source = "None"
+
             if end:
                 end_source = "boundsPeriod.end"
             elif dur_value is not None:
@@ -1776,9 +1790,11 @@ def extract_antibiotic_order_window(resources: dict) -> list:
                 "med_system": med_sys, "med_code": med_code, "med_display": med_disp,
                 "dosage_index": idx + 1,
                 "start_date": start, "end_date": end,
+                "authored_on": authored_on,
                 "bounds_duration_value": dur_value, "bounds_duration_unit": dur_unit,
                 "sig_text": sig_text, "parsed_duration": parsed_duration,
-                "has_start": bool(start),
+                "has_start": start_source != "None",
+                "start_source": start_source,
                 "has_end_or_duration": end_source != "None",
                 "end_source": end_source,
             })
@@ -1796,16 +1812,18 @@ ABX_HEADERS = [
     "Dosage\nIndex",                # E
     "Start Date\n(boundsPeriod.start)",  # F
     "End Date\n(boundsPeriod.end)",      # G
-    "Bounds\nDuration Value",       # H
-    "Bounds\nDuration Unit",        # I
-    "Dosage Text\n(sig)",           # J
-    "Duration Parsed\nfrom Text",   # K
-    "Has Start\nDate",              # L
-    "Has End Date\nor Duration",    # M
-    "End / Duration\nSource",       # N
+    "authoredOn",                   # H
+    "Bounds\nDuration Value",       # I
+    "Bounds\nDuration Unit",        # J
+    "Dosage Text\n(sig)",           # K
+    "Duration Parsed\nfrom Text",   # L
+    "Has Start\nDate",              # M
+    "Start Date\nSource",           # N
+    "Has End Date\nor Duration",    # O
+    "End / Duration\nSource",       # P
 ]
 
-ABX_WIDTHS = [36, 46, 18, 46, 10, 22, 22, 14, 14, 50, 18, 12, 14, 18]
+ABX_WIDTHS = [36, 46, 18, 46, 10, 22, 22, 22, 14, 14, 50, 18, 12, 18, 14, 18]
 
 
 def write_antibiotic_window_sheet(ws, rows: list) -> None:
@@ -1841,12 +1859,13 @@ def write_antibiotic_window_sheet(ws, rows: list) -> None:
         put(5,  row["dosage_index"], CENTER)
         put(6,  row["start_date"])
         put(7,  row["end_date"])
-        put(8,  row["bounds_duration_value"], CENTER)
-        put(9,  row["bounds_duration_unit"],  CENTER)
-        put(10, row["sig_text"])
-        put(11, row["parsed_duration"], CENTER)
+        put(8,  row["authored_on"])
+        put(9,  row["bounds_duration_value"], CENTER)
+        put(10, row["bounds_duration_unit"],  CENTER)
+        put(11, row["sig_text"])
+        put(12, row["parsed_duration"], CENTER)
 
-        for col, flag_val in [(12, row["has_start"]), (13, row["has_end_or_duration"])]:
+        for col, flag_val in [(13, row["has_start"]), (15, row["has_end_or_duration"])]:
             label = "Yes" if flag_val else "No"
             fc = ws.cell(row=ri, column=col, value=label)
             fc.alignment = CENTER
@@ -1857,7 +1876,8 @@ def write_antibiotic_window_sheet(ws, rows: list) -> None:
                 fc.fill = _fill(_C["no_bg"])
                 fc.font = _font(bold=True, color=_C["no_fg"])
 
-        put(14, row["end_source"], CENTER)
+        put(14, row["start_source"], CENTER)
+        put(16, row["end_source"], CENTER)
 
     # Summary counts at the bottom
     gap_row = len(rows) + 3
@@ -1867,9 +1887,9 @@ def write_antibiotic_window_sheet(ws, rows: list) -> None:
     ws.row_dimensions[gap_row].height = 18
     for ci, val in enumerate([
         "TOTALS", f"{len(rows)} dosage entries", "", "",
-        "", "", "", "", "", "", "",
-        f"{n_start} have start", f"{n_end} have end/duration",
-        f"{n_both} have both",
+        "", "", "", "", "", "", "", "", "",
+        f"{n_start} have start", "",
+        f"{n_end} have end/duration  |  {n_both} have both",
     ], 1):
         cell = ws.cell(row=gap_row, column=ci, value=val)
         cell.font = _font(bold=True, color=_C["hdr_fg"])
