@@ -10,6 +10,7 @@ and produces a multi-sheet Excel workbook covering:
   • Medication Codes     — per-code frequency table across medication resources
   • Category Codes       — category coding breakdown per resource type
   • Data Inventory       — exhaustive element-path frequency across all resources
+  • Antibiotic Order Window — MedicationRequest start/end (or duration) data availability
 
 Usage:
     python fhir_analyzer.py <root_dir> [-o output.xlsx]
@@ -21,6 +22,7 @@ Requirements:
 """
 
 import json
+import re
 import sys
 import argparse
 from pathlib import Path
@@ -1686,6 +1688,199 @@ def write_missing_dose_route_sheet(ws, missing_rows: list) -> None:
     ws.freeze_panes = "A2"
 
 
+# ── Antibiotic order window (MedicationRequest timing) ───────────────────────
+
+# Matches free-text duration phrases in dosageInstruction.text such as
+# "x 5 days", "for 10 Days", "x10 days", "for 2 weeks".
+_DURATION_TEXT_RE = re.compile(
+    r"(?:x|for)\s*(\d+)\s*(day|days|wk|wks|week|weeks|hr|hrs|hour|hours|month|months)",
+    re.IGNORECASE,
+)
+
+
+def _parse_duration_from_text(text: str) -> str:
+    """Return a 'N unit' string if a duration phrase is found in free text, else ''."""
+    if not text:
+        return ""
+    m = _DURATION_TEXT_RE.search(text)
+    if not m:
+        return ""
+    return f"{m.group(1)} {m.group(2)}"
+
+
+def extract_antibiotic_order_window(resources: dict) -> list:
+    """
+    For each MedicationRequest, determine whether the FHIR data contains the
+    minimum information needed to identify an intended start/end (order
+    window) for the medication — relevant for antibiotic start/stop measures.
+
+    Looks at, per dosageInstruction entry:
+      - timing.repeat.boundsPeriod.start  → order start date
+      - timing.repeat.boundsPeriod.end    → order end date
+      - timing.repeat.boundsDuration      → duration (value + unit) when no
+                                             explicit end date is given
+      - dosageInstruction.text (the "sig")→ free-text duration, e.g. "x 5 days",
+                                             used as a last-resort fallback
+
+    Returns one row per dosageInstruction entry (or one placeholder row for
+    MedicationRequests with no dosageInstruction at all).
+    """
+    rows = []
+
+    for r in resources.get("MedicationRequest", []):
+        rid                          = r.get("id", "")
+        med_sys, med_code, med_disp  = _primary_med_code(r, "MedicationRequest")
+        dosage_instructions          = r.get("dosageInstruction") or []
+
+        if not dosage_instructions:
+            rows.append({
+                "resource_id": rid,
+                "med_system": med_sys, "med_code": med_code, "med_display": med_disp,
+                "dosage_index": None,
+                "start_date": "", "end_date": "",
+                "bounds_duration_value": None, "bounds_duration_unit": "",
+                "sig_text": "", "parsed_duration": "",
+                "has_start": False, "has_end_or_duration": False,
+                "end_source": "None",
+            })
+            continue
+
+        for idx, di in enumerate(dosage_instructions):
+            if not isinstance(di, dict):
+                continue
+
+            repeat        = ((di.get("timing") or {}).get("repeat")) or {}
+            bounds_period = repeat.get("boundsPeriod") or {}
+            bounds_dur    = repeat.get("boundsDuration") or {}
+
+            start = (bounds_period.get("start") or "").strip()
+            end   = (bounds_period.get("end") or "").strip()
+
+            dur_value = bounds_dur.get("value")
+            dur_unit  = (bounds_dur.get("unit") or bounds_dur.get("code") or "").strip()
+
+            sig_text         = (di.get("text") or "").strip()
+            parsed_duration  = _parse_duration_from_text(sig_text)
+
+            if end:
+                end_source = "boundsPeriod.end"
+            elif dur_value is not None:
+                end_source = "boundsDuration"
+            elif parsed_duration:
+                end_source = "sig text"
+            else:
+                end_source = "None"
+
+            rows.append({
+                "resource_id": rid,
+                "med_system": med_sys, "med_code": med_code, "med_display": med_disp,
+                "dosage_index": idx + 1,
+                "start_date": start, "end_date": end,
+                "bounds_duration_value": dur_value, "bounds_duration_unit": dur_unit,
+                "sig_text": sig_text, "parsed_duration": parsed_duration,
+                "has_start": bool(start),
+                "has_end_or_duration": end_source != "None",
+                "end_source": end_source,
+            })
+
+    return rows
+
+
+# ── Sheet: Antibiotic Order Window ────────────────────────────────────────────
+
+ABX_HEADERS = [
+    "Resource ID",                  # A
+    "Med Code System",              # B
+    "Med Code",                     # C
+    "Med Display",                  # D
+    "Dosage\nIndex",                # E
+    "Start Date\n(boundsPeriod.start)",  # F
+    "End Date\n(boundsPeriod.end)",      # G
+    "Bounds\nDuration Value",       # H
+    "Bounds\nDuration Unit",        # I
+    "Dosage Text\n(sig)",           # J
+    "Duration Parsed\nfrom Text",   # K
+    "Has Start\nDate",              # L
+    "Has End Date\nor Duration",    # M
+    "End / Duration\nSource",       # N
+]
+
+ABX_WIDTHS = [36, 46, 18, 46, 10, 22, 22, 14, 14, 50, 18, 12, 14, 18]
+
+
+def write_antibiotic_window_sheet(ws, rows: list) -> None:
+    ws.row_dimensions[1].height = 40
+    for ci, h in enumerate(ABX_HEADERS, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font      = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill      = _fill(_C["hdr_bg"])
+        cell.alignment = CENTER
+
+    if not rows:
+        ws.cell(row=2, column=1, value="No MedicationRequest data found.")
+        return
+
+    stripe_color = _C["stripe_a"]
+
+    for ri, row in enumerate(rows, 2):
+        ws.row_dimensions[ri].height = 15
+        stripe_color = _C["stripe_a"] if stripe_color == _C["stripe_b"] else _C["stripe_b"]
+        stripe = _fill(stripe_color)
+
+        def put(col, val, align=LEFT, fmt=None):
+            cell = ws.cell(row=ri, column=col, value=val)
+            cell.fill = stripe; cell.alignment = align; cell.font = _font()
+            if fmt:
+                cell.number_format = fmt
+            return cell
+
+        put(1,  row["resource_id"])
+        put(2,  row["med_system"])
+        put(3,  row["med_code"])
+        put(4,  row["med_display"])
+        put(5,  row["dosage_index"], CENTER)
+        put(6,  row["start_date"])
+        put(7,  row["end_date"])
+        put(8,  row["bounds_duration_value"], CENTER)
+        put(9,  row["bounds_duration_unit"],  CENTER)
+        put(10, row["sig_text"])
+        put(11, row["parsed_duration"], CENTER)
+
+        for col, flag_val in [(12, row["has_start"]), (13, row["has_end_or_duration"])]:
+            label = "Yes" if flag_val else "No"
+            fc = ws.cell(row=ri, column=col, value=label)
+            fc.alignment = CENTER
+            if flag_val:
+                fc.fill = _fill(_C["yes_bg"])
+                fc.font = _font(bold=True, color=_C["yes_fg"])
+            else:
+                fc.fill = _fill(_C["no_bg"])
+                fc.font = _font(bold=True, color=_C["no_fg"])
+
+        put(14, row["end_source"], CENTER)
+
+    # Summary counts at the bottom
+    gap_row = len(rows) + 3
+    n_start    = sum(1 for r in rows if r["has_start"])
+    n_end      = sum(1 for r in rows if r["has_end_or_duration"])
+    n_both     = sum(1 for r in rows if r["has_start"] and r["has_end_or_duration"])
+    ws.row_dimensions[gap_row].height = 18
+    for ci, val in enumerate([
+        "TOTALS", f"{len(rows)} dosage entries", "", "",
+        "", "", "", "", "", "", "",
+        f"{n_start} have start", f"{n_end} have end/duration",
+        f"{n_both} have both",
+    ], 1):
+        cell = ws.cell(row=gap_row, column=ci, value=val)
+        cell.font = _font(bold=True, color=_C["hdr_fg"])
+        cell.fill = _fill(_C["summary_hdr"])
+        cell.alignment = CENTER if ci > 1 else LEFT
+
+    for ci, w in enumerate(ABX_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+
+
 # ── Patient → Medication map ──────────────────────────────────────────────────
 #
 # Memory note: this pass works entirely on the resources dict that is already
@@ -2362,6 +2557,9 @@ def main() -> None:
     print("Building medication code co-occurrence crosswalk…")
     cooccurrence_rows = build_code_cooccurrence(resources)
 
+    print("Extracting antibiotic order window data…")
+    abx_window_rows = extract_antibiotic_order_window(resources)
+
     print("Building patient → medication map…")
     patient_med_rows, unresolved_count = build_patient_medication_map(resources)
     if unresolved_count:
@@ -2422,7 +2620,11 @@ def main() -> None:
     ws_xwalk = wb.create_sheet("Med Code Crosswalk")
     write_code_cooccurrence_sheet(ws_xwalk, cooccurrence_rows)
 
-    # 9 — Patient Medication Map
+    # 10 — Antibiotic Order Window
+    ws_abx = wb.create_sheet("Antibiotic Order Window")
+    write_antibiotic_window_sheet(ws_abx, abx_window_rows)
+
+    # 11 — Patient Medication Map
     ws_pt = wb.create_sheet("Patient Medication Map")
     write_patient_medication_sheet(ws_pt, patient_med_rows, unresolved_count)
 
@@ -2443,6 +2645,9 @@ def main() -> None:
         f"LOINC:       {len({r['loinc_code'] for r in loinc_rows}):,} distinct codes  |  "
         f"{len(loinc_rows):,} (resource type, field, code) entries\n"
         f"Crosswalk:   {len(cooccurrence_rows):,} inferred cross-system code pairs\n"
+        f"Abx window:  {len(abx_window_rows):,} dosage entries  |  "
+        f"{sum(1 for r in abx_window_rows if r['has_start']):,} have start  |  "
+        f"{sum(1 for r in abx_window_rows if r['has_end_or_duration']):,} have end/duration\n"
         f"Patient map: {len({r['patient_id'] for r in patient_med_rows}):,} patients  |  "
         f"{len(patient_med_rows):,} (patient × system) rows  |  "
         f"{unresolved_count:,} unresolvable\n"
